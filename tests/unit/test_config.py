@@ -34,10 +34,10 @@ def _reload(monkeypatch, **env):
 
 def test_defaults_load_clean(monkeypatch):
     cfg = _reload(monkeypatch)
-    assert cfg.settings.asr.provider == "mlx"
+    assert cfg.settings.asr.provider == "dashscope"
     assert cfg.settings.llm.provider == "ablework"
-    assert cfg.settings.tts.provider == "mlx"
-    assert cfg.settings.tts.voice == "serena"
+    assert cfg.settings.tts.provider == "dashscope"
+    assert cfg.settings.tts.voice == "Maia"
     assert cfg.settings.warmup is True
     assert cfg.settings.storage.keep_audio is False
 

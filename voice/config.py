@@ -320,7 +320,7 @@ def _load() -> Settings:
             think=_env_bool("OLLAMA_THINK", False),
         ),
         asr=AsrConfig(
-            provider=_env_str("ASR_PROVIDER", "mlx").lower(),
+            provider=_env_str("ASR_PROVIDER", "dashscope").lower(),
             mlx_model=_env_str("MLX_QWEN_MODEL", "Qwen/Qwen3-ASR-1.7B"),
             stream_chunk_sec=_env_float("ASR_STREAM_CHUNK_SEC", 1.5),
         ),
@@ -331,12 +331,12 @@ def _load() -> Settings:
             system_prompt=_load_system_prompt(data_dir),
         ),
         tts=TtsConfig(
-            provider=_env_str("TTS_PROVIDER", "mlx").lower(),
+            provider=_env_str("TTS_PROVIDER", "dashscope").lower(),
             mlx_model=_env_str(
                 "MLX_TTS_MODEL", "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16"
             ),
             sr=_env_int("MLX_TTS_SR", 24000),
-            voice=_env_str("MLX_TTS_VOICE", "serena"),
+            voice=_env_str("MLX_TTS_VOICE", "Maia"),
             lang=_env_str("MLX_TTS_LANG", "chinese"),
             temperature=_env_float("MLX_TTS_TEMPERATURE", 0.5),
             seed=_env_int("MLX_TTS_SEED", 42),

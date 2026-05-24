@@ -8,14 +8,12 @@
 #   4. TUI 退出(Q 或 Ctrl+C)时 trap 把 server 也关掉
 #
 # 用法:
-#   ./start-tui.sh                                     # 用 server.py 默认 model
-#   MLX_QWEN_MODEL=Qwen/Qwen3-ASR-1.7B ./start-tui.sh  # 切大 ASR
+#   ./start-tui.sh                                     # 默认全云: ASR/TTS=dashscope (voice=Maia), LLM=ablework
+#   ASR_PROVIDER=mlx TTS_PROVIDER=mlx ./start-tui.sh   # 切回本地 mlx 模型
+#   MLX_QWEN_MODEL=Qwen/Qwen3-ASR-1.7B ASR_PROVIDER=mlx ./start-tui.sh  # 本地大 ASR
 #   OLLAMA_MODEL=gpt-oss:20b LLM_PROVIDER=ollama ./start-tui.sh
 #   LLM_PROVIDER=dashscope ./start-tui.sh             # 云 LLM (qwen3.7-max)
-#   LLM_PROVIDER=ablework ./start-tui.sh              # ablework 主干 agent
-#   TTS_PROVIDER=dashscope MLX_TTS_VOICE=Maia ./start-tui.sh   # 云 TTS,可选 Maia/Cherry/Chelsie 等
-#   ASR_PROVIDER=dashscope ./start-tui.sh             # 云 ASR (paraformer-realtime-v2),保留 partials
-#   ASR_PROVIDER=dashscope TTS_PROVIDER=dashscope LLM_PROVIDER=ablework ./start-tui.sh   # 全云配置
+#   MLX_TTS_VOICE=Cherry ./start-tui.sh               # 换云 TTS voice (Cherry/Chelsie 等)
 #   WARMUP=0 ./start-tui.sh                            # 跳过启动 warm(快但首次 chat 慢)
 #
 # 如果你想顺便也开浏览器 UI(vite :5173),用 ./start.sh 而不是这个。

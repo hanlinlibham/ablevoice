@@ -107,9 +107,9 @@ class TestStripTtsUnfriendly:
         ("贵州茅台(600519)",                              "贵州茅台"),
         ("中国平安(601318.SH)",                           "中国平安"),
         ("贵州茅台（600519）",                            "贵州茅台"),  # full-width
-        # URLs — drop entirely
-        ("详见 https://tw.trip.com/blog/uefa-champions/", "详见 "),
-        ("访问 http://x.com 即可",                        "访问  即可"),
+        # URLs — drop entirely (whitespace then collapsed)
+        ("详见 https://tw.trip.com/blog/uefa-champions/", "详见"),
+        ("访问 http://x.com 即可",                        "访问 即可"),
         # Markdown links — keep text only
         ("[欧冠赛程](https://tw.trip.com/blog/x/)",       "欧冠赛程"),
         ("参考 [文档](https://example.com)",              "参考 文档"),
@@ -126,10 +126,17 @@ class TestStripTtsUnfriendly:
         ("2026 年第一季度",                               "2026 年第一季度"),
         ("营收增长 25%",                                  "营收增长 25%"),
         ("第 (1) 项",                                     "第 (1) 项"),
-        # The user-reported end-to-end case
+        # Structural symbols — bullets, range dashes, leftover slashes
+        ("- 欧冠赛程 - 决赛",                             "欧冠赛程 决赛"),
+        ("项 / 类",                                       "项 类"),
+        # Word-internal hyphen survives
+        ("Microsoft-Word 文档",                           "Microsoft-Word 文档"),
+        # Markdown leftovers
+        ("**重要** ~~过期~~ 提示",                        "重要 过期 提示"),
+        # The user-reported end-to-end case — now no dash/slash artifacts
         (
             "参考来源:- [欧冠赛程 - 5/31决赛](https://tw.trip.com/blog/uefa-champions/)",
-            "参考来源:- 欧冠赛程 - 5月31日决赛",
+            "参考来源: 欧冠赛程 5月31日决赛",
         ),
         ("",                                              ""),
     ])

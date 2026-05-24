@@ -222,22 +222,46 @@ _ENGLISH_TICKER = re.compile(r"([一-鿿])\s+([A-Z]{3,5})\b")
 _DATE_YMD = re.compile(r"\b(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})\b")
 _DATE_MD  = re.compile(r"(?<!\d)(\d{1,2})[/\-](\d{1,2})(?!\d)(?!\s*[\-/])")
 
+# "Structural" symbols TTS reads literally:
+#   - Markdown remnants:  * _ ~ > < = | # ` [ ]
+#   - Dashes / slashes used as list bullets, separators, ranges
+# We drop ``-`` / ``—`` / ``/`` only when NOT surrounded by word chars
+# on both sides (so "Microsoft-Word" stays, "5月31日 - 决赛" becomes
+# "5月31日 决赛"). Numbers like "5/31" have already been normalised to
+# "5月31日" by the date passes above; this pass catches the leftover
+# bare separators between Chinese phrases.
+_MD_REMNANT_RE = re.compile(r"[*_~><=|#`\[\]]+")
+_STRUCTURAL_DASH_RE = re.compile(r"(?<![A-Za-z0-9])[-—]+(?![A-Za-z0-9])")
+_STRUCTURAL_SLASH_RE = re.compile(r"(?<![A-Za-z0-9])/+(?![A-Za-z0-9])")
+# Whitespace cleanup — collapse runs and trim spaces adjacent to
+# Chinese sentence punctuation.
+_MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+(?=[,。!?,:;])")
+
 
 def strip_tts_unfriendly(s: str) -> str:
     """Remove / rewrite patterns TTS reads character-by-character.
 
-    Pipeline (order matters — MD link before bare URL strip so we don't
-    leave empty ``[text]()`` after the URL got eaten):
+    Pipeline (order matters):
 
-      1. Markdown links ``[text](url)`` → keep ``text`` only
+      1. Markdown links ``[text](url)`` → keep ``text`` only (BEFORE
+         the bare URL strip — otherwise URL inside ``[](url)`` gets
+         eaten and we're left with empty ``[text]()``)
       2. Remaining bare URLs → drop entirely
       3. Parens-wrapped stock codes after Chinese → drop the parens
       4. Bare ticker with market suffix (.SH/.HK) → drop
       5. Parens-wrapped English (any length) after Chinese → drop
       6. Bare English 3-5 caps after Chinese → drop
-      7. Dates ``Y/M/D`` / ``M/D`` (slash or dash) → 年月日 form
+      7. Dates ``Y/M/D`` / ``M/D`` (slash or dash) → 年月日 form —
+         this runs BEFORE the structural-dash strip so date dashes
+         get normalised, not eaten
+      8. Markdown remnants (``* _ ~ > < = | # `` `[ ]``) → drop
+      9. Structural ``-`` / ``—`` / ``/`` between non-word chars → drop
+     10. Whitespace cleanup (collapse runs, trim before punct)
 
-    Plain numbers (``2026 年``, ``25%``, bullet ``(1)``) survive.
+    Plain numbers (``2026 年``, ``25%``, bullet ``(1)``), Chinese
+    sentence punct, and word-internal hyphens (``Microsoft-Word``)
+    survive.
     """
     s = _MD_LINK_RE.sub(r"\1", s)
     s = _URL_RE.sub("", s)
@@ -245,10 +269,14 @@ def strip_tts_unfriendly(s: str) -> str:
     s = _TICKER_WITH_SUFFIX.sub("", s)
     s = _ENGLISH_IN_PARENS.sub(r"\1", s)
     s = _ENGLISH_TICKER.sub(r"\1", s)
-    # Date normalization — Y/M/D first (most specific) then M/D.
     s = _DATE_YMD.sub(r"\1年\2月\3日", s)
     s = _DATE_MD.sub(r"\1月\2日", s)
-    return s
+    s = _MD_REMNANT_RE.sub("", s)
+    s = _STRUCTURAL_DASH_RE.sub("", s)
+    s = _STRUCTURAL_SLASH_RE.sub("", s)
+    s = _MULTI_SPACE_RE.sub(" ", s)
+    s = _SPACE_BEFORE_PUNCT_RE.sub("", s)
+    return s.strip()
 
 
 # URL pass strips ONLY when the URL is followed by whitespace or
