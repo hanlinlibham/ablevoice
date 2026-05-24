@@ -93,7 +93,7 @@ def ensure_mlx_tts_ref():
     return _mlx_ref_audio
 
 
-def _synth_mlx_sync(text: str) -> tuple[bytes, int, int]:
+def _synth_mlx_sync(text: str, voice: str | None = None) -> tuple[bytes, int, int]:
     """Run on the MLX worker thread. Dispatches on model variant:
 
       - ``custom_voice`` (default): real per-speaker embeddings — call
@@ -109,6 +109,7 @@ def _synth_mlx_sync(text: str) -> tuple[bytes, int, int]:
     import numpy as np  # noqa: PLC0415
 
     t = settings.tts
+    speaker = voice or t.voice
     mx.random.seed(t.seed)
     model = ensure_mlx_tts()
     ttype = getattr(model.config, "tts_model_type", "base")
@@ -116,7 +117,7 @@ def _synth_mlx_sync(text: str) -> tuple[bytes, int, int]:
     chunks = []
     if ttype == "custom_voice":
         cv_kwargs: dict[str, object] = {
-            "speaker":     t.voice,
+            "speaker":     speaker,
             "language":    t.lang,
             "temperature": t.temperature,
         }
@@ -125,13 +126,13 @@ def _synth_mlx_sync(text: str) -> tuple[bytes, int, int]:
         gen = model.generate_custom_voice(text, **cv_kwargs)
     elif ttype == "voice_design":
         # voice_design needs ``instruct`` (free-form voice description).
-        # voice is reused as the instruction string here.
+        # ``speaker`` is reused as the instruction string here.
         gen = model.generate_voice_design(
-            text, instruct=t.voice, temperature=t.temperature,
+            text, instruct=speaker, temperature=t.temperature,
         )
     else:
         gen_kwargs: dict[str, object] = {
-            "voice": t.voice, "temperature": t.temperature,
+            "voice": speaker, "temperature": t.temperature,
         }
         if _mlx_ref_audio is not None:
             gen_kwargs["ref_audio"] = _mlx_ref_audio
@@ -152,13 +153,13 @@ class MlxTts:
     def model_id(self) -> str:
         return settings.tts.mlx_model
 
-    async def synth(self, text: str) -> tuple[bytes, int, int]:
-        return await mlx_call(_synth_mlx_sync, text)
+    async def synth(self, text: str, *, voice: str | None = None) -> tuple[bytes, int, int]:
+        return await mlx_call(_synth_mlx_sync, text, voice)
 
 
 # --- DashScope cloud --------------------------------------------------------
 
-def _synth_dashscope_sync(text: str) -> tuple[bytes, int, int]:
+def _synth_dashscope_sync(text: str, voice: str | None = None) -> tuple[bytes, int, int]:
     """qwen3-tts-flash / qwen3-tts-instruct-flash. Returns the same
     triple as MLX so the caller doesn't care which backend produced it.
     Still applies our trim + RMS-normalise post-process so chunk joins
@@ -169,15 +170,17 @@ def _synth_dashscope_sync(text: str) -> tuple[bytes, int, int]:
     import numpy as np  # noqa: PLC0415
 
     t = settings.tts
-    if not settings.dashscope.api_key:
+    ds = settings.dashscope
+    speaker = voice or t.voice
+    if not ds.api_key:
         raise RuntimeError("TTS_PROVIDER=dashscope but DASHSCOPE_API_KEY not set")
 
     body: dict = {
-        "model": t.ds_model,
+        "model": ds.tts_model,
         "input": {
             "text": text,
-            "voice": t.voice,
-            "language_type": t.ds_lang,
+            "voice": speaker,
+            "language_type": ds.tts_lang,
         },
     }
     # ``instructions`` is a sibling of ``input`` (NOT inside it) per the
@@ -185,7 +188,7 @@ def _synth_dashscope_sync(text: str) -> tuple[bytes, int, int]:
     # supports it and we actually have an instruction string — sending
     # to plain qwen3-tts-flash silently no-ops but adds 1600-token
     # accounting overhead.
-    if t.instruct and "instruct" in t.ds_model:
+    if t.instruct and "instruct" in ds.tts_model:
         body["instructions"] = t.instruct
         body["optimize_instructions"] = True
     headers = {
@@ -195,7 +198,7 @@ def _synth_dashscope_sync(text: str) -> tuple[bytes, int, int]:
     # ``verify=False`` to match the chat path — corp proxy CA isn't in
     # trust store.
     with httpx.Client(timeout=30.0, verify=False) as client:
-        r = client.post(t.ds_url, headers=headers, json=body)
+        r = client.post(ds.tts_url, headers=headers, json=body)
         if r.status_code != 200:
             raise RuntimeError(f"dashscope TTS HTTP {r.status_code}: {r.text[:200]}")
         out = r.json().get("output", {})
@@ -224,9 +227,9 @@ class DashscopeTts:
     def model_id(self) -> str:
         return settings.dashscope.tts_model
 
-    async def synth(self, text: str) -> tuple[bytes, int, int]:
+    async def synth(self, text: str, *, voice: str | None = None) -> tuple[bytes, int, int]:
         # Cloud path: HTTP-bound, but we still funnel through mlx_call
         # so the GPU/CPU contention with MLX (if a parallel local model
         # is also serving) stays serialised — and so the asyncio loop
         # isn't blocked by the sync httpx call.
-        return await mlx_call(_synth_dashscope_sync, text)
+        return await mlx_call(_synth_dashscope_sync, text, voice)

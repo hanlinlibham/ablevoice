@@ -73,6 +73,7 @@ async def run_chat_pipeline(
     emit: Emit,
     *,
     polished_text: Optional[str] = None,
+    voice_override: Optional[str] = None,
 ) -> dict:
     """Run one chat turn — (optional) polish → LLM streaming + sentence-
     level TTS — and push progress to ``emit``. Transport-agnostic (called
@@ -159,7 +160,7 @@ async def run_chat_pipeline(
                 break
             t0 = time.monotonic()
             try:
-                wav_bytes, sr, n_samples = await tts.synth(sent)
+                wav_bytes, sr, n_samples = await tts.synth(sent, voice=voice_override)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("tts_task failed for: %r", sent[:80])
                 await emit("error", {"message": f"TTS: {exc}"})
@@ -176,7 +177,7 @@ async def run_chat_pipeline(
                 "idx": n_audio,
             })
 
-    await emit("meta", {"model": llm.model_id, "voice": settings.tts.voice})
+    await emit("meta", {"model": llm.model_id, "voice": voice_override or settings.tts.voice})
     llm_t = asyncio.create_task(llm_task(), name="chat-llm")
     tts_t = asyncio.create_task(tts_task(), name="chat-tts")
     try:
@@ -220,8 +221,8 @@ async def run_chat_pipeline(
     return summary
 
 
-async def synth_one(text: str) -> tuple[bytes, int, int]:
+async def synth_one(text: str, *, voice: Optional[str] = None) -> tuple[bytes, int, int]:
     """One-shot TTS — for the /tts HTTP endpoint and the WS ``tts``
     event. Returns ``(wav_bytes, sample_rate, n_samples)``."""
     tts = get_tts()
-    return await tts.synth(text)
+    return await tts.synth(text, voice=voice)

@@ -71,6 +71,14 @@ class WsSession:
         self.audio_bytes: int = 0
         self.t_started: float = 0.0
         self._send_lock = asyncio.Lock()
+        # Per-session runtime overrides (settable via WS events from the
+        # TUI / browser UI). When set, take precedence over the global
+        # settings.tts.voice / settings.polish.enabled values for THIS
+        # WS session only — doesn't mutate global Settings (which is
+        # frozen by design).
+        self.voice_override: Optional[str] = None
+        self.tts_provider_override: Optional[str] = None  # "mlx" | "dashscope"
+        self.polish_override: Optional[bool] = None       # None = use global default
 
     async def send_json(self, obj: dict) -> None:
         async with self._send_lock:
@@ -275,14 +283,24 @@ class WsSession:
         if not said:
             return
 
-        # Polish the transcript before chat. Runs synchronously here so
-        # we can both emit ``transcript_polished`` (UI feedback) and pass
-        # the cleaned text to the chat pipeline. polish_text() never
-        # raises — on any failure ``.final`` is the raw text.
-        # Always emit the event (even when skipped) so the client has a
-        # stable signal it can wait on; ``skipped`` tells the UI whether
-        # the polished text differs from raw.
-        polish_result = await polish_text(said)
+        # Polish the transcript before chat. Per-session ``polish_override``
+        # (settable via ``set_polish`` WS event from the TUI) wins; falls
+        # back to global ``settings.polish.enabled`` otherwise. When
+        # disabled we still emit ``transcript_polished`` with ``skipped``
+        # so the client UI has a stable signal.
+        polish_active = (
+            settings.polish.enabled if self.polish_override is None
+            else self.polish_override
+        )
+        if polish_active:
+            polish_result = await polish_text(said)
+        else:
+            from .polish.api import PolishResult
+            polish_result = PolishResult(
+                final=said, raw=said, polished="", skipped=True,
+                attempts=0, ok=True, errors=["polish_disabled_per_session"],
+                ms=0,
+            )
         await self.send_json({
             "type": "transcript_polished",
             "id": transcript_id,
@@ -313,8 +331,14 @@ class WsSession:
         async def emit(ev_name: str, data: dict) -> None:
             payload = {"type": ev_name if ev_name != "done" else "chat_done", **data}
             await self.send_json(payload)
+        # Pass voice override down so MLX TTS picks the right speaker
+        # for this session. None means "use settings.tts.voice default".
         self.chat_task = asyncio.create_task(
-            run_chat_pipeline(sid, said, emit, polished_text=chat_input),
+            run_chat_pipeline(
+                sid, said, emit,
+                polished_text=chat_input,
+                voice_override=self.voice_override,
+            ),
             name=f"chat-{sid[:8]}",
         )
 
@@ -350,6 +374,48 @@ class WsSession:
         prior = reset_conversation(self.session_id or "")
         await self.send_json({"type": "history_reset", "cleared": prior})
 
+    async def handle_set_voice(self, ev: dict) -> None:
+        """Per-session voice override. ``provider`` selects mlx /
+        dashscope route for the override (defaults to keeping the
+        current TTS provider). Empty/missing ``voice`` clears the
+        override back to global default."""
+        voice = (ev.get("voice") or "").strip()
+        provider = ev.get("provider")
+        if voice:
+            self.voice_override = voice
+            self.tts_provider_override = (
+                provider if provider in ("mlx", "dashscope") else None
+            )
+        else:
+            self.voice_override = None
+            self.tts_provider_override = None
+        logger.info(
+            "ws set_voice session=%s voice=%r provider=%r",
+            (self.session_id or "?")[:8], self.voice_override, self.tts_provider_override,
+        )
+        await self.send_json({
+            "type": "voice_set",
+            "voice": self.voice_override,
+            "provider": self.tts_provider_override,
+        })
+
+    async def handle_set_polish(self, ev: dict) -> None:
+        """Per-session polish toggle. ``enabled`` bool; missing/None
+        clears the override back to global ``POLISH_ENABLED``."""
+        if "enabled" in ev:
+            self.polish_override = bool(ev["enabled"])
+        else:
+            self.polish_override = None
+        logger.info(
+            "ws set_polish session=%s polish_override=%r",
+            (self.session_id or "?")[:8], self.polish_override,
+        )
+        await self.send_json({
+            "type": "polish_set",
+            "enabled": (settings.polish.enabled if self.polish_override is None
+                        else self.polish_override),
+        })
+
     # --- main loop ---------------------------------------------------------
 
     HANDLERS = {
@@ -359,6 +425,8 @@ class WsSession:
         "interrupt":       "handle_interrupt",
         "tts":             "handle_tts",
         "reset":           "handle_reset",
+        "set_voice":       "handle_set_voice",
+        "set_polish":      "handle_set_polish",
     }
 
     async def run(self) -> None:

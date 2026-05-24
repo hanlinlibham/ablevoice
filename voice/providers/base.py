@@ -51,9 +51,13 @@ class LlmProvider(Protocol):
 
 class TtsProvider(Protocol):
     """Synth one text chunk. Returns the encoded WAV bytes + sample
-    rate + sample count (so caller can compute dur_ms)."""
+    rate + sample count (so caller can compute dur_ms).
 
-    async def synth(self, text: str) -> tuple[bytes, int, int]: ...
+    ``voice`` overrides the configured default for this single call —
+    callers (chat pipeline / WS handler) thread per-session voice
+    settings through without mutating global config."""
+
+    async def synth(self, text: str, *, voice: str | None = None) -> tuple[bytes, int, int]: ...
 
     @property
     def model_id(self) -> str: ...

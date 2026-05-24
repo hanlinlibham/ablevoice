@@ -161,7 +161,7 @@ async def tts(req: TTSRequest) -> Response:
             ) from exc
     else:
         try:
-            wav_bytes, sr, n_samples = await get_tts().synth(text)
+            wav_bytes, sr, n_samples = await get_tts().synth(text, voice=req.voice)
         except Exception as exc:  # noqa: BLE001
             logger.exception("tts failed")
             raise HTTPException(
