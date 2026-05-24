@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets / state / user-data — never commit
+.env
+.env.local
+.env.*.local
+transcripts.db
+transcripts.db-journal
+recordings/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# daily_record 本地工作日记,不进开源
+docs/done/
+
+# Logs
+*.log
