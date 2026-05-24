@@ -273,6 +273,13 @@ class VoiceTUI(App):
         # Prepare assistant bubble that will fill via tokens.
         conv.append(Message("assistant", "", info="", streaming=True))
         status = self.query_one("#status", StatusBar)
+        # Phase transition: ASR done → polish window opens.
+        status.finalizing = False
+        # Server emits transcript_polished within ~15ms-1.5s of transcript;
+        # only show the polishing chip if the user has polish enabled
+        # (otherwise the chip would briefly flash for a no-op).
+        if status.polish_enabled:
+            status.polishing = True
         status.chatting = True
         self.first_audio_logged = False
 
@@ -449,10 +456,12 @@ class VoiceTUI(App):
         mic.level = 0.0
         mic.t_started = 0.0
         self.turn_t_stop = time.monotonic()
-        # Polish takes ~500ms — show indicator immediately, server
-        # follow-up transcript_polished event clears it.
-        if status.polish_enabled:
-            status.polishing = True
+        # ASR finalize on long recordings can take 5-6s — show a
+        # dedicated "识别中" state for that window. polishing is set
+        # ONLY between transcript and transcript_polished (handled by
+        # _h_transcript) so the user sees the actual phase progression
+        # instead of one stuck label.
+        status.finalizing = True
         if self.ws_client is not None and self.ws_client.is_open:
             await self.ws_client.send_json({
                 "type": "stop_recording",

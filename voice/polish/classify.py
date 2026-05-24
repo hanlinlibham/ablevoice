@@ -35,6 +35,11 @@ _ENTITY_HINT = re.compile(
     r"|[A-Z][A-Z0-9]{2,}"
 )
 
+# ASR 流式拼接 artifact — 同字符跨句号 ("指。指" / "今。今" / "数。数")。
+# 这是 mlx-qwen3-asr streaming session 把跨 chunk 的词切两半留下的痕迹,
+# 看起来"通顺"(有句号 + 没 filler)但其实需要 polish 修复。
+_STREAMING_ARTIFACT_RE = re.compile(r"(.)。\s*\1")
+
 _QUESTION_MARKERS = ("吗", "呢", "?", "?", "几", "多少", "怎么", "如何", "是不是", "什么")
 
 
@@ -53,12 +58,20 @@ def classify(text: str) -> Classification:
 
     has_filler = any(f in s for f in _FILLERS)
     has_end_punct = s.endswith(_END_PUNCT)
+    has_streaming_artifact = bool(_STREAMING_ARTIFACT_RE.search(s))
     # "Too short" — under 8 chars often a single command word that polish
     # would mangle. Skip.
     is_too_short = length < 8
-    # "Too clean" — no口语 fillers + proper punctuation. Probably already
-    # written-style; sending to LLM risks over-rewriting it.
-    is_too_clean = (not has_filler) and has_end_punct and length < 80
+    # "Too clean" — no口语 fillers + proper punctuation + no ASR streaming
+    # split artifact. The artifact gate is essential: text like
+    # "港股恒生指。指数会不会有？" looks clean on the surface (has 句号,
+    # no filler) but the "指。指" pattern is a streaming chunk boundary
+    # that polish should fix. Without the gate the heuristic skips
+    # exactly the cases that need cleaning most.
+    is_too_clean = (
+        (not has_filler) and (not has_streaming_artifact)
+        and has_end_punct and length < 80
+    )
 
     return Classification(
         length=length,

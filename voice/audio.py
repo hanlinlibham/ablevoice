@@ -178,3 +178,44 @@ def strip_markdown_inline(s: str) -> str:
     s = re.sub(r",\s*$", "", s, flags=re.MULTILINE)
     s = _MD_STRIP_RE.sub("", s)
     return s
+
+
+# --- TTS speakability cleanup ----------------------------------------------
+#
+# LLMs (especially the ablework agent which doesn't honour our
+# SYSTEM_PROMPT) emit stock codes / tickers / file paths inline like
+# "贵州茅台 600519.SH" or "贵州茅台(600519)". TTS then reads
+# "六〇〇五一九点 SH" character by character which is unlistenable.
+#
+# We strip the most-confidently-recognised patterns BEFORE handing the
+# sentence to TTS. The chat history (text shown in UI) keeps the
+# original — only the audio path is cleaned. Conservative: only strip
+# when the pattern is unambiguous (has a market suffix, or is paren-
+# wrapped after a Chinese word) so plain numbers like "2026年" survive.
+
+# 4-6 digits with a .XX or .XXX suffix (e.g. 600519.SH, AAPL.US).
+_TICKER_WITH_SUFFIX = re.compile(r"\s?\d{3,6}\.[A-Za-z]{2,3}\b")
+# (123456) or (123456.SH) or (123) after a Chinese character — the
+# Chinese-anchor prevents stripping bullet numbers like "(1) 第一项".
+_TICKER_IN_PARENS = re.compile(
+    r"([一-鿿])\s*[(（]\s*\d{3,6}(?:\.[A-Za-z]{2,3})?\s*[)）]"
+)
+# Common English-abbrev pattern after a Chinese phrase: 苹果公司 AAPL
+# → keep "苹果公司". 3-5 all-caps letters that immediately follow a
+# Chinese run with at most one space. Anchored on Chinese to avoid
+# eating legit English in mostly-English replies.
+_ENGLISH_TICKER = re.compile(r"([一-鿿])\s+([A-Z]{3,5})\b")
+
+
+def strip_tts_unfriendly(s: str) -> str:
+    """Remove patterns TTS reads character-by-character. Conservative —
+    only confidently-recognised stock codes / English tickers.
+
+    Order matters: PARENS first so we strip the WHOLE wrapper (parens
+    + digits + suffix) atomically; otherwise WITH_SUFFIX would consume
+    the ``.SH`` part inside and leave an empty ``()`` behind.
+    """
+    s = _TICKER_IN_PARENS.sub(r"\1", s)
+    s = _TICKER_WITH_SUFFIX.sub("", s)
+    s = _ENGLISH_TICKER.sub(r"\1", s)
+    return s

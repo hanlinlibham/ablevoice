@@ -17,6 +17,7 @@ from voice.audio import (
     pcm_float_to_wav_bytes,
     pop_speakable,
     strip_markdown_inline,
+    strip_tts_unfriendly,
     wrap_pcm_int16_as_wav,
 )
 
@@ -98,6 +99,29 @@ class TestStripMarkdownInline:
 
 
 # --- WAV packing ------------------------------------------------------------
+
+class TestStripTtsUnfriendly:
+    """TTS-bound text — strip codes that TTS reads character by character."""
+
+    @pytest.mark.parametrize("inp,out", [
+        # ticker with market suffix — strip wholesale
+        ("贵州茅台 600519.SH",   "贵州茅台"),
+        ("阿里巴巴9988.HK 港股",  "阿里巴巴 港股"),  # also catches no-space
+        # paren-wrapped after Chinese — strip code, keep Chinese
+        ("贵州茅台(600519)",      "贵州茅台"),
+        ("中国平安(601318.SH)",   "中国平安"),
+        ("贵州茅台（600519）",     "贵州茅台"),  # full-width parens too
+        # English ticker after Chinese phrase
+        ("苹果公司 AAPL 涨了",     "苹果公司 涨了"),
+        # Plain numbers must SURVIVE — only confident patterns strip
+        ("2026 年第一季度",        "2026 年第一季度"),
+        ("营收增长 25%",           "营收增长 25%"),
+        ("第 (1) 项",              "第 (1) 项"),     # bullet number not after Chinese run
+        ("",                       ""),
+    ])
+    def test_golden(self, inp, out):
+        assert strip_tts_unfriendly(inp) == out
+
 
 class TestPcmFloatToWavBytes:
 

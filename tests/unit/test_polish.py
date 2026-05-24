@@ -42,6 +42,17 @@ class TestClassify:
         assert classify("营收增长了 25 个百分点").get("has_numbers") is True
         assert classify("没有数字的句子").get("has_numbers") is False
 
+    def test_streaming_artifact_forces_polish(self):
+        # ASR streaming chunk boundary leaves "X。X" patterns. Looks
+        # clean on the surface (has 句号, no filler) but needs polish.
+        c1 = classify("港股恒生指。指数会不会有？新的变化。")
+        assert c1["is_too_clean"] is False
+        c2 = classify("请帮我看一下今。今天的财报数据。")
+        assert c2["is_too_clean"] is False
+        # Same-char-across-period is the trigger — unrelated chars don't.
+        c3 = classify("会议结束。开始下个议程。")
+        assert c3["is_too_clean"] is True
+
 
 class TestValidate:
 

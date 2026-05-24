@@ -29,12 +29,20 @@ def _spinner_frame() -> str:
 
 class StatusBar(Static):
     """Top bar — shows connection state, current mode, latency telemetry,
-    active provider + voice + polish flag."""
+    active provider + voice + polish flag.
+
+    Phase priority (highest first), drives the colored mode chip:
+      reconnecting > recording > finalizing > polishing > chatting > idle
+
+    States are *not* mutually exclusive at the field level (server WS
+    events arrive asynchronously) — the render() method picks the
+    highest-priority active flag."""
     connected = reactive(False)
     reconnecting = reactive(False)
     recording = reactive(False)
-    chatting = reactive(False)
+    finalizing = reactive(False)           # ASR finalize after stop_recording
     polishing = reactive(False)            # polish agent is running
+    chatting = reactive(False)
     playing = reactive(False)
     asr_info = reactive("")
     llm_info = reactive("")
@@ -49,7 +57,8 @@ class StatusBar(Static):
         self.set_interval(1 / 8, self._maybe_refresh)
 
     def _maybe_refresh(self) -> None:
-        if self.chatting or self.recording or self.polishing or self.reconnecting:
+        if (self.chatting or self.recording or self.polishing
+                or self.finalizing or self.reconnecting):
             self.refresh()
 
     def render(self):
@@ -62,6 +71,12 @@ class StatusBar(Static):
             t.append(label, style=style)
         elif self.recording:
             t.append(f" {spin} 录音中 ", style="bold black on yellow")
+        elif self.finalizing:
+            # Between stop_recording (client) and transcript event (server) —
+            # ASR is finalising the last chunk(s). On a 30s recording this
+            # can easily take 5-6s; without a dedicated state the user
+            # would see a misleading "整理中" instead.
+            t.append(f" {spin} 识别中 ", style="bold black on cyan")
         elif self.polishing:
             t.append(f" {spin} 整理中 ", style="bold black on magenta")
         elif self.chatting:
@@ -189,25 +204,29 @@ class Conversation(Static):
     @staticmethod
     def _render_user(m: Message, frame: str):
         cursor = "  [blink]▮[/blink]" if m.streaming else ""
-        title = f"[bold cyan]你[/bold cyan]{cursor}"
+        polish_changed = bool(m.raw) and (m.raw != m.text)
+        polished_marker = " [magenta bold]✨ 已整理[/magenta bold]" if polish_changed else ""
+        title = f"[bold cyan]你[/bold cyan]{polished_marker}{cursor}"
         if m.info:
             title += f"  [dim]{m.info}[/dim]"
+        # Border shifts to magenta when polish actually changed the text
+        # so the eye lands on the bubble that has the diff.
+        border = "magenta" if polish_changed else "cyan"
         if m.streaming and not m.text:
             body = Text.from_markup(f"[cyan]{frame}[/cyan] [dim italic]听…[/dim italic]")
+        elif polish_changed:
+            # Show polished (bold) above + raw (strikethrough + dim)
+            # below so the user sees the diff at a glance.
+            body = Text()
+            body.append(m.text or "(empty)", style="bold")
+            body.append("\n  ", style="")
+            body.append("原 ▸ ", style="dim magenta")
+            body.append(m.raw, style="dim strike")
         else:
-            body_text = m.text or "(empty)"
-            # If polish changed the text, show original on a dim line
-            # below — same panel, no extra row.
-            if m.raw and m.raw != m.text:
-                body = Text()
-                body.append(body_text)
-                body.append("\n原:", style="dim italic")
-                body.append(m.raw, style="dim")
-            else:
-                body = Text(body_text)
+            body = Text(m.text or "(empty)")
         return Panel(
             body, title=title, title_align="left",
-            border_style="cyan", padding=(0, 1),
+            border_style=border, padding=(0, 1),
         )
 
     @staticmethod

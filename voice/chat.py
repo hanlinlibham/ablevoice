@@ -38,7 +38,7 @@ import logging
 import time
 from typing import Awaitable, Callable, Optional
 
-from .audio import pop_speakable
+from .audio import pop_speakable, strip_tts_unfriendly
 from .config import settings
 from .polish import polish_text
 from .providers import get_llm, get_tts
@@ -158,9 +158,13 @@ async def run_chat_pipeline(
             sent = await tts_q.get()
             if sent is None:
                 break
+            # Strip TTS-unfriendly tokens (stock codes, English tickers)
+            # before synth. The original sentence still goes back to the
+            # client in ``text`` so the UI shows the LLM's actual output.
+            spoken = strip_tts_unfriendly(sent)
             t0 = time.monotonic()
             try:
-                wav_bytes, sr, n_samples = await tts.synth(sent, voice=voice_override)
+                wav_bytes, sr, n_samples = await tts.synth(spoken, voice=voice_override)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("tts_task failed for: %r", sent[:80])
                 await emit("error", {"message": f"TTS: {exc}"})
