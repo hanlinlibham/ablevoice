@@ -143,18 +143,18 @@ class DashscopeRealtimeAsr:
 
     @property
     def model_id(self) -> str:
-        return f"dashscope:{settings.asr.ds_model}"
+        return f"dashscope:{settings.dashscope.asr_model}"
 
     async def start(self) -> None:
-        if not settings.llm.ds_api_key:
+        if not settings.dashscope.api_key:
             raise RuntimeError("ASR_PROVIDER=dashscope but DASHSCOPE_API_KEY not set")
         sslctx = ssl.create_default_context()
         sslctx.check_hostname = False
         sslctx.verify_mode = ssl.CERT_NONE
         self._ws = await _wspkg.connect(
-            settings.asr.ds_ws_url,
+            settings.dashscope.asr_ws_url,
             additional_headers={
-                "Authorization": f"bearer {settings.llm.ds_api_key}",
+                "Authorization": f"bearer {settings.dashscope.api_key}",
                 "X-DashScope-DataInspection": "enable",
             },
             ssl=sslctx,
@@ -166,11 +166,11 @@ class DashscopeRealtimeAsr:
                 "task_group": "audio",
                 "task": "asr",
                 "function": "recognition",
-                "model": settings.asr.ds_model,
+                "model": settings.dashscope.asr_model,
                 "parameters": {
                     "sample_rate": self._sr,
                     "format": "pcm",
-                    "language_hints": [settings.asr.ds_lang],
+                    "language_hints": [settings.dashscope.asr_lang],
                 },
                 "input": {},
             },

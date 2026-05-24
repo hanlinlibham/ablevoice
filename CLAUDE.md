@@ -53,7 +53,7 @@ mode middleware / ContextCandidateProvider)在 ablework 主仓另行推进,
 ├── start.sh / start-tui.sh      # 一键启动
 ├── transcripts.db               # SQLite,启动时 voice.db.init() 自动建表
 ├── recordings/                  # opt-in audio store (only if KEEP_AUDIO=1)
-├── .env.local                   # cred (TOKEN, DASHSCOPE_API_KEY) — gitignored
+├── .env.local                   # cred (ABLEWORK_TOKEN, DASHSCOPE_API_KEY) — gitignored
 ├── voice/                       # 服务端核心包 — Tier B 拆分后的模块
 │   ├── config.py                #   所有 env → 单例 Settings + validation
 │   ├── runtime.py               #   单线程 MLX executor + 共享 httpx

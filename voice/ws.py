@@ -100,12 +100,12 @@ class WsSession:
         await self.send_json({
             "type": "ready",
             "asr_provider": settings.asr.provider,
-            "asr_model_id": settings.asr.active_model_id,
+            "asr_model_id": settings.asr_active_model_id,
             "tts_provider": settings.tts.provider,
-            "tts_model_id": settings.tts.active_model_id,
+            "tts_model_id": settings.tts_active_model_id,
             "tts_voice":    settings.tts.voice,
             "llm_provider": settings.llm.provider,
-            "llm_model_id": settings.llm.active_model_id,
+            "llm_model_id": settings.llm_active_model_id,
             "tts_sr": settings.tts.sr,
         })
 
@@ -195,7 +195,7 @@ class WsSession:
                                   "id": "", "text": "", "ms": 0,
                                   "audio_bytes": 0,
                                   "peak_level": peak_level,
-                                  "model": settings.asr.active_model_id})
+                                  "model": settings.asr_active_model_id})
             if self.asr is not None:
                 await self.asr.cancel()
                 self.asr = None

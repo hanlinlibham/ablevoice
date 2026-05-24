@@ -114,42 +114,31 @@ def _synth_mlx_sync(text: str) -> tuple[bytes, int, int]:
     ttype = getattr(model.config, "tts_model_type", "base")
 
     chunks = []
-    try:
-        if ttype == "custom_voice":
-            cv_kwargs: dict[str, object] = {
-                "speaker":     t.voice,
-                "language":    t.lang,
-                "temperature": t.temperature,
-            }
-            if t.instruct:
-                cv_kwargs["instruct"] = t.instruct
-            try:
-                gen = model.generate_custom_voice(text, **cv_kwargs)
-            except TypeError:
-                # Older mlx-audio doesn't accept instruct on CustomVoice.
-                cv_kwargs.pop("instruct", None)
-                gen = model.generate_custom_voice(text, **cv_kwargs)
-        elif ttype == "voice_design":
-            # voice_design needs ``instruct`` (free-form voice description).
-            # voice is reused as the instruction string here.
-            gen = model.generate_voice_design(
-                text, instruct=t.voice, temperature=t.temperature,
-            )
-        else:
-            gen_kwargs: dict[str, object] = {
-                "voice": t.voice, "temperature": t.temperature,
-            }
-            if _mlx_ref_audio is not None:
-                gen_kwargs["ref_audio"] = _mlx_ref_audio
-                gen_kwargs["ref_text"] = t.ref_text
-            gen = model.generate(text, **gen_kwargs)
-        for result in gen:
-            chunks.append(getattr(result, "audio", result))
-    except TypeError:
-        # Some mlx-audio versions don't accept temperature on certain
-        # entry points — retry minimal-kwarg.
-        for result in model.generate(text, voice=t.voice):
-            chunks.append(getattr(result, "audio", result))
+    if ttype == "custom_voice":
+        cv_kwargs: dict[str, object] = {
+            "speaker":     t.voice,
+            "language":    t.lang,
+            "temperature": t.temperature,
+        }
+        if t.instruct:
+            cv_kwargs["instruct"] = t.instruct
+        gen = model.generate_custom_voice(text, **cv_kwargs)
+    elif ttype == "voice_design":
+        # voice_design needs ``instruct`` (free-form voice description).
+        # voice is reused as the instruction string here.
+        gen = model.generate_voice_design(
+            text, instruct=t.voice, temperature=t.temperature,
+        )
+    else:
+        gen_kwargs: dict[str, object] = {
+            "voice": t.voice, "temperature": t.temperature,
+        }
+        if _mlx_ref_audio is not None:
+            gen_kwargs["ref_audio"] = _mlx_ref_audio
+            gen_kwargs["ref_text"] = t.ref_text
+        gen = model.generate(text, **gen_kwargs)
+    for result in gen:
+        chunks.append(getattr(result, "audio", result))
 
     if not chunks:
         return b"", t.sr, 0
@@ -180,7 +169,7 @@ def _synth_dashscope_sync(text: str) -> tuple[bytes, int, int]:
     import numpy as np  # noqa: PLC0415
 
     t = settings.tts
-    if not settings.llm.ds_api_key:
+    if not settings.dashscope.api_key:
         raise RuntimeError("TTS_PROVIDER=dashscope but DASHSCOPE_API_KEY not set")
 
     body: dict = {
@@ -200,7 +189,7 @@ def _synth_dashscope_sync(text: str) -> tuple[bytes, int, int]:
         body["instructions"] = t.instruct
         body["optimize_instructions"] = True
     headers = {
-        "Authorization": f"Bearer {settings.llm.ds_api_key}",
+        "Authorization": f"Bearer {settings.dashscope.api_key}",
         "Content-Type": "application/json",
     }
     # ``verify=False`` to match the chat path — corp proxy CA isn't in
@@ -233,7 +222,7 @@ def _synth_dashscope_sync(text: str) -> tuple[bytes, int, int]:
 class DashscopeTts:
     @property
     def model_id(self) -> str:
-        return settings.tts.ds_model
+        return settings.dashscope.tts_model
 
     async def synth(self, text: str) -> tuple[bytes, int, int]:
         # Cloud path: HTTP-bound, but we still funnel through mlx_call

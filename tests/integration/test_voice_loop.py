@@ -82,7 +82,7 @@ def test_chat_sse(live_server):
     since LLM output is non-deterministic; checks event sequence + that
     we got at least one token and one audio chunk."""
     sid = "pytest-" + uuid.uuid4().hex[:6]
-    seen = {"token": 0, "audio": 0, "done": 0, "error": 0}
+    seen = {"token": 0, "audio_chunk": 0, "done": 0, "error": 0}
     with httpx.stream(
         "POST", f"{live_server}/chat",
         json={"session_id": sid, "text": "用一句话介绍你自己。"},
@@ -102,7 +102,7 @@ def test_chat_sse(live_server):
                     break
     assert seen["error"] == 0
     assert seen["token"] > 0
-    assert seen["audio"] > 0
+    assert seen["audio_chunk"] > 0
     assert seen["done"] == 1
 
 

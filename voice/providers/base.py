@@ -121,4 +121,4 @@ async def transcribe_file(audio_path: str) -> tuple[str, str]:
 
 def settings_asr_model_id() -> str:
     from ..config import settings
-    return settings.asr.active_model_id
+    return settings.asr_active_model_id

@@ -78,16 +78,16 @@ async def _run_mlx(messages: list[BaseMessage]) -> str:
 # --- DashScope path ---------------------------------------------------------
 
 async def _run_dashscope(messages: list[BaseMessage]) -> str:
-    if not settings.llm.ds_api_key:
+    if not settings.dashscope.api_key:
         raise RuntimeError(
             "POLISH_PROVIDER=dashscope but DASHSCOPE_API_KEY not set"
         )
     headers = {
-        "Authorization": f"Bearer {settings.llm.ds_api_key}",
+        "Authorization": f"Bearer {settings.dashscope.api_key}",
         "Content-Type": "application/json",
     }
     body = {
-        "model": settings.polish.ds_model,
+        "model": settings.dashscope.polish_model,
         "messages": _to_dicts(messages),
         "stream": False,
         "max_tokens": settings.polish.max_tokens,
@@ -99,7 +99,7 @@ async def _run_dashscope(messages: list[BaseMessage]) -> str:
     }
     async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
         r = await client.post(
-            f"{settings.llm.ds_base_url}/chat/completions",
+            f"{settings.dashscope.base_url}/chat/completions",
             headers=headers, json=body,
         )
         if r.status_code != 200:

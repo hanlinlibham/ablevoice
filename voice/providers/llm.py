@@ -122,30 +122,30 @@ class MlxLlm:
 class DashscopeLlm:
     @property
     def model_id(self) -> str:
-        return settings.llm.ds_model
+        return settings.dashscope.chat_model
 
     async def stream(
         self, messages: list[dict], session_id: str
     ) -> AsyncIterator[str]:
-        if not settings.llm.ds_api_key:
+        if not settings.dashscope.api_key:
             raise RuntimeError(
                 "DASHSCOPE_API_KEY not set — `export DASHSCOPE_API_KEY=sk-...` "
                 "before starting the server, or switch LLM_PROVIDER back to mlx."
             )
         headers = {
-            "Authorization": f"Bearer {settings.llm.ds_api_key}",
+            "Authorization": f"Bearer {settings.dashscope.api_key}",
             "Content-Type": "application/json",
         }
         body = {
-            "model": settings.llm.ds_model,
+            "model": settings.dashscope.chat_model,
             "messages": messages,
             "stream": True,
             "max_tokens": 1024,
-            "enable_thinking": settings.llm.ds_thinking,
+            "enable_thinking": settings.dashscope.chat_thinking,
         }
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream(
-                "POST", f"{settings.llm.ds_base_url}/chat/completions",
+                "POST", f"{settings.dashscope.base_url}/chat/completions",
                 headers=headers, json=body,
             ) as r:
                 if r.status_code != 200:
@@ -189,10 +189,10 @@ class AbleworkLlm:
     async def stream(
         self, messages: list[dict], session_id: str
     ) -> AsyncIterator[str]:
-        if not settings.llm.ablework_token:
+        if not settings.ablework.token:
             raise RuntimeError(
-                "ABLEWORK_TOKEN (or TOKEN) not set — put it in .env.local or "
-                "export TOKEN=eyJ... before starting the server."
+                "ABLEWORK_TOKEN not set — put it in .env.local or "
+                "export ABLEWORK_TOKEN=eyJ... before starting the server."
             )
         # Drop system messages — ablework has its own preset-driven
         # system prompt and only wants user/assistant alternation.
@@ -205,15 +205,15 @@ class AbleworkLlm:
             "controller_mode": "on",
         }
         headers = {
-            "Authorization": f"Bearer {settings.llm.ablework_token}",
+            "Authorization": f"Bearer {settings.ablework.token}",
             "Content-Type": "application/json",
         }
         # Cert verify off by default — see config.py comment.
         async with httpx.AsyncClient(
-            timeout=60.0, verify=settings.llm.ablework_verify_ssl,
+            timeout=60.0, verify=settings.ablework.verify_ssl,
         ) as client:
             async with client.stream(
-                "POST", settings.llm.ablework_url, headers=headers, json=body,
+                "POST", settings.ablework.url, headers=headers, json=body,
             ) as r:
                 if r.status_code != 200:
                     detail = (await r.aread())[:300].decode("utf-8", "replace")
@@ -250,7 +250,7 @@ class AbleworkLlm:
 class OllamaLlm:
     @property
     def model_id(self) -> str:
-        return settings.llm.ollama_model
+        return settings.ollama.model
 
     async def stream(
         self, messages: list[dict], session_id: str
@@ -258,12 +258,12 @@ class OllamaLlm:
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream(
                 "POST",
-                f"{settings.llm.ollama_url}/api/chat",
+                f"{settings.ollama.url}/api/chat",
                 json={
-                    "model": settings.llm.ollama_model,
+                    "model": settings.ollama.model,
                     "messages": messages,
                     "stream": True,
-                    "think": settings.llm.ollama_think,
+                    "think": settings.ollama.think,
                 },
             ) as r:
                 if r.status_code != 200:

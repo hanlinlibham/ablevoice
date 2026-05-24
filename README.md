@@ -93,6 +93,51 @@ cd demo-ui && npm install && cd ..
 
 macOS 第一次按录音键会弹麦克风权限,允许即可。
 
+## 配置系统(`.env.local` + `voice/config.py`)
+
+**所有 secret 走 `.env.local`**(gitignored)。新人配环境抄一份模板:
+
+```bash
+cp .env.example .env.local
+# 编辑 .env.local 填:
+#   DASHSCOPE_API_KEY=sk-...    (云 ASR/LLM/TTS/Polish 共用)
+#   ABLEWORK_TOKEN=eyJ...        (ablework 后端 JWT)
+```
+
+**单 source of truth**:`voice/config.py` 的 `settings` 单例 — 43 个 env 全在这一处定义、解析、validate。typo 的 int/float 会在 startup 抛 RuntimeError;空 secret 会 warn 一句。
+
+**结构**:
+
+```
+settings
+├── dashscope    # api_key + base_url + chat_model + asr_model + tts_model + polish_model (一个 vendor account 服务所有 cloud stage)
+├── ablework     # url + token + verify_ssl
+├── ollama       # url + model
+├── asr          # provider + mlx_model + stream_chunk_sec
+├── llm          # provider + mlx_model + system_prompt
+├── tts          # provider + mlx_model + voice + 12 个调参
+├── polish       # enabled + provider + use_polished_for_chat
+├── sentence     # 句切 4 个常量
+├── storage      # db_path / audio_dir / keep_audio
+└── warmup
+```
+
+**运行时查实际生效配置**:
+
+```bash
+curl -s http://127.0.0.1:8501/config | jq
+# secret 被脱敏成 "sk-4…(len=35)" / "eyJh…(len=3023)" — 能验配但不泄露
+```
+
+**SYSTEM_PROMPT 支持文件**(多行中文 prompt 用 env 转义麻烦):
+
+```bash
+# .env.local
+SYSTEM_PROMPT_FILE=prompts/system.md
+```
+
+完整 env 参考见 [`.env.example`](.env.example)。
+
 ## Provider 配置
 
 通过 env 切换。默认配置见 server.py 顶部,常用组合:
@@ -120,7 +165,7 @@ ASR_PROVIDER=dashscope LLM_PROVIDER=dashscope TTS_PROVIDER=dashscope \
 | `MLX_TTS_VOICE` | `serena` | 本地 9 个 / 云端 ~50 个 |
 | `MLX_TTS_INSTRUCT` | (新闻播报指令) | 任何自然语言描述,空串关闭 |
 | `DASHSCOPE_API_KEY` | (.env.local 读) | sk-xxx |
-| `TOKEN` | (.env.local 读) | ablework JWT |
+| `ABLEWORK_TOKEN` | (.env.local 读) | ablework JWT |
 | `VOICE_INPUT_DEVICE` | (PortAudio default) | sounddevice 设备索引 |
 | `VOICE_INPUT_NAME` | — | substring 匹配设备名,蓝牙重连后仍有效 |
 | `KEEP_AUDIO` | `0` | `1` 保留上传录音到 `recordings/` |

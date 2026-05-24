@@ -102,7 +102,7 @@ def step_tts(http_base: str) -> None:
 def step_chat_sse(http_base: str) -> None:
     print("[4] POST /chat (SSE)")
     sid = "smoke-" + uuid.uuid4().hex[:6]
-    seen = {"token": 0, "audio": 0, "done": 0, "error": 0}
+    seen = {"token": 0, "audio_chunk": 0, "done": 0, "error": 0}
     full_text = []
     t0 = time.monotonic()
     first_audio_ms = None
@@ -132,7 +132,7 @@ def step_chat_sse(http_base: str) -> None:
                     continue
                 if event == "token":
                     full_text.append(payload.get("delta", ""))
-                elif event == "audio" and first_audio_ms is None:
+                elif event == "audio_chunk" and first_audio_ms is None:
                     first_audio_ms = int((time.monotonic() - t0) * 1000)
                 elif event == "error":
                     fail(f"chat error event: {payload}")
@@ -142,11 +142,11 @@ def step_chat_sse(http_base: str) -> None:
         fail(f"chat saw {seen['error']} error events")
     if seen["token"] == 0:
         fail("no token events")
-    if seen["audio"] == 0:
+    if seen["audio_chunk"] == 0:
         fail("no audio_chunk events")
     if seen["done"] == 0:
         fail("no done event")
-    ok(f"events: token={seen['token']} audio={seen['audio']} done=1  first_audio={first_audio_ms}ms")
+    ok(f"events: token={seen['token']} audio={seen['audio_chunk']} done=1  first_audio={first_audio_ms}ms")
 
 
 # --- step 5: /ws full voice loop -------------------------------------------

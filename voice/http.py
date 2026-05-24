@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 from . import chat, db
 from .audio import pcm_float_to_wav_bytes
-from .config import settings
+from .config import public_view, settings
 from .providers import get_tts
 from .providers.asr import ensure_mlx_session, mlx_session_loaded
 from .providers.llm import mlx_llm_loaded
@@ -92,25 +92,37 @@ async def health() -> dict[str, object]:
         "ok": True,
         "model_loaded": mlx_session_loaded(),
         "asr_provider": settings.asr.provider,
-        "asr_model_id": settings.asr.active_model_id,
+        "asr_model_id": settings.asr_active_model_id,
         "tts_provider": settings.tts.provider,
         "tts_model_loaded": mlx_tts_loaded(),
-        "tts_model_id": settings.tts.active_model_id,
+        "tts_model_id": settings.tts_active_model_id,
         "tts_variant": mlx_tts_variant(),
         "tts_voice": settings.tts.voice,
         "tts_voices_available": mlx_tts_voices(),
         "tts_sr": settings.tts.sr,
         "llm_provider": settings.llm.provider,
-        "llm_model_id": settings.llm.active_model_id,
+        "llm_model_id": settings.llm_active_model_id,
         "llm_loaded": mlx_llm_loaded() if settings.llm.provider == "mlx" else None,
-        "llm_url": settings.llm.active_url,
-        "dashscope_key_set": bool(settings.llm.ds_api_key)
+        "llm_url": settings.llm_active_url,
+        "dashscope_key_set": bool(settings.dashscope.api_key)
                              if settings.llm.provider == "dashscope" else None,
-        "ablework_token_set": bool(settings.llm.ablework_token)
+        "ablework_token_set": bool(settings.ablework.token)
                               if settings.llm.provider == "ablework" else None,
         "keep_audio": settings.storage.keep_audio,
         "db": str(settings.storage.db_path),
     }
+
+
+# --- /config ---------------------------------------------------------------
+#
+# /health is for "is the server up + which providers are wired";
+# /config is for "what's the FULL effective configuration including
+# tunable knobs". Secrets (api_key, token) are redacted to a 4-char
+# prefix + length — enough to verify a value is set without leaking.
+
+@router.get("/config")
+async def config_view() -> dict:
+    return public_view()
 
 
 # --- /tts ------------------------------------------------------------------
@@ -131,8 +143,11 @@ async def tts(req: TTSRequest) -> Response:
         raise HTTPException(status_code=413, detail="text > 4000 chars")
 
     started = time.monotonic()
-    # For MLX, allow per-request voice override (bypasses provider
-    # wrapper for backward compat with the existing /tts surface).
+    # For MLX, per-request ``voice`` / ``lang`` override goes through a
+    # dedicated path so callers can A/B speakers without restarting
+    # (the regular MlxTts.synth() uses the configured defaults). Cloud
+    # TTS ignores these — change MLX_TTS_VOICE in env if you want to
+    # switch the cloud-default voice.
     if settings.tts.provider == "mlx" and (req.voice or req.lang):
         try:
             wav_bytes, sr, n_samples = await _synth_mlx_override(
@@ -171,7 +186,7 @@ async def tts(req: TTSRequest) -> Response:
             "X-TTS-Duration-Ms": str(dur_ms),
             "X-TTS-Sample-Rate": str(sr),
             "X-TTS-Voice": str(req.voice or settings.tts.voice),
-            "X-TTS-Model": settings.tts.active_model_id,
+            "X-TTS-Model": settings.tts_active_model_id,
         },
     )
 
@@ -190,13 +205,8 @@ async def _synth_mlx_override(
         if lang:
             kwargs["lang_code"] = lang
         chunks = []
-        try:
-            for result in model.generate(text, **kwargs):
-                chunks.append(getattr(result, "audio", result))
-        except TypeError:
-            # Some mlx-audio wrappers don't accept voice/lang_code.
-            for result in model.generate(text):
-                chunks.append(getattr(result, "audio", result))
+        for result in model.generate(text, **kwargs):
+            chunks.append(getattr(result, "audio", result))
         if not chunks:
             return b"", settings.tts.sr, 0
         flat = np.concatenate([np.asarray(c, dtype=np.float32).reshape(-1) for c in chunks])
@@ -323,10 +333,9 @@ async def chat_route(req: ChatRequest) -> StreamingResponse:
         out_q: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
 
         async def emit(event: str, data: dict) -> None:
-            # SSE uses ``audio`` instead of ``audio_chunk`` for one
-            # historical reason (existing UIs subscribed to that name).
-            sse_name = {"audio_chunk": "audio"}.get(event, event)
-            await out_q.put(_sse(sse_name, data))
+            # SSE event names match the WS protocol verbatim — same
+            # discriminator across transports.
+            await out_q.put(_sse(event, data))
 
         async def runner() -> None:
             try:
