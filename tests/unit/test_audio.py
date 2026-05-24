@@ -17,6 +17,7 @@ from voice.audio import (
     pcm_float_to_wav_bytes,
     pop_speakable,
     strip_markdown_inline,
+    strip_terminated_links_and_urls,
     strip_tts_unfriendly,
     wrap_pcm_int16_as_wav,
 )
@@ -25,29 +26,31 @@ from voice.audio import (
 # --- sentence splitter ------------------------------------------------------
 
 class TestPopSpeakable:
-    """Two-tier punctuation policy:
-
-      1. STRONG end (。!?) splits anywhere past ``min_chars``.
-      2. PAUSE (,, ;) only kicks in past ``soft_cap``.
-      3. Below cap with no strong end → return None (wait for more).
-    """
+    """STRICT-SENTENCE policy: only split at 。!?\\n. Earlier pause-split
+    fallback (split at comma when buf > 24-40 chars) was removed — it
+    fragmented sentences and TTS prosody suffered. We accept slightly
+    longer first-audio latency for materially better speech quality."""
 
     def test_empty_returns_none(self):
         assert pop_speakable("") == (None, "")
 
     def test_strong_end_splits(self):
-        # SENTENCE_STRONG_PATTERN.search(buf, min_chars=6) — needs the
-        # punctuation to be at position >= 6, so 5 chars before 。 is
-        # below the threshold. Use a buffer long enough to clear it.
         chunk, rest = pop_speakable("这是一个测试句子。继续说下去")
         assert chunk == "这是一个测试句子。"
         assert rest == "继续说下去"
 
-    def test_below_cap_no_strong_returns_none(self):
-        # 10 chars, no strong punct, below default soft_cap (40)
-        chunk, rest = pop_speakable("一个比较长的句子开头中")
+    def test_below_min_chars_returns_none(self):
+        # Strong-end at pos 4 is below default min_chars=6.
+        chunk, rest = pop_speakable("到家了。下一步")
         assert chunk is None
-        assert rest == "一个比较长的句子开头中"
+
+    def test_long_buffer_without_end_returns_none(self):
+        # Pre-strict, this would have pause-split at the comma. Now
+        # waits patiently for 。 — quality > latency.
+        buf = "今天的天气真的非常不错,我们出去走走吧朋友们继续讲讲今天遇到的事情"
+        chunk, rest = pop_speakable(buf)
+        assert chunk is None
+        assert rest == buf
 
     def test_force_flushes_remainder(self):
         chunk, rest = pop_speakable("还没说完", force=True)
@@ -59,20 +62,13 @@ class TestPopSpeakable:
         assert chunk is None
         assert rest == ""
 
-    def test_first_chunk_uses_first_caps(self):
-        # First-chunk soft_cap defaults to 24; build a >24 char buffer
-        # with no strong end so the pause-split kicks in.
-        buf = "今天的天气真的非常不错,我们出去走走吧朋友们"  # 22 chars, has comma at pos 12
-        chunk, rest = pop_speakable(buf, is_first=False)  # soft_cap=40, won't trigger
+    def test_period_in_url_does_not_split(self):
+        # The bug that prompted strict-mode: ``.`` inside a URL token
+        # used to trigger a split, fragmenting the URL across TTS chunks.
+        # Strict-mode + the new strong-pattern (no \\. in it) leaves
+        # URLs intact.
+        chunk, rest = pop_speakable("访问 https://tw.trip.com/blog 即可")
         assert chunk is None
-        # With is_first=True and soft_cap=24, length 22 < 24 → still None
-        chunk, rest = pop_speakable(buf, is_first=True)
-        assert chunk is None
-        # Past the first cap → pause-split.
-        longer = buf + "继续讲讲今天遇到的事情"
-        chunk, rest = pop_speakable(longer, is_first=True)
-        assert chunk is not None
-        assert chunk.endswith(",")
 
 
 # --- markdown stripper ------------------------------------------------------
@@ -101,26 +97,83 @@ class TestStripMarkdownInline:
 # --- WAV packing ------------------------------------------------------------
 
 class TestStripTtsUnfriendly:
-    """TTS-bound text — strip codes that TTS reads character by character."""
+    """TTS-bound text — strip / rewrite patterns TTS reads literally."""
 
     @pytest.mark.parametrize("inp,out", [
-        # ticker with market suffix — strip wholesale
-        ("贵州茅台 600519.SH",   "贵州茅台"),
-        ("阿里巴巴9988.HK 港股",  "阿里巴巴 港股"),  # also catches no-space
-        # paren-wrapped after Chinese — strip code, keep Chinese
-        ("贵州茅台(600519)",      "贵州茅台"),
-        ("中国平安(601318.SH)",   "中国平安"),
-        ("贵州茅台（600519）",     "贵州茅台"),  # full-width parens too
-        # English ticker after Chinese phrase
-        ("苹果公司 AAPL 涨了",     "苹果公司 涨了"),
+        # Ticker with market suffix
+        ("贵州茅台 600519.SH",                            "贵州茅台"),
+        ("阿里巴巴9988.HK 港股",                          "阿里巴巴 港股"),
+        # Paren-wrapped after Chinese
+        ("贵州茅台(600519)",                              "贵州茅台"),
+        ("中国平安(601318.SH)",                           "中国平安"),
+        ("贵州茅台（600519）",                            "贵州茅台"),  # full-width
+        # URLs — drop entirely
+        ("详见 https://tw.trip.com/blog/uefa-champions/", "详见 "),
+        ("访问 http://x.com 即可",                        "访问  即可"),
+        # Markdown links — keep text only
+        ("[欧冠赛程](https://tw.trip.com/blog/x/)",       "欧冠赛程"),
+        ("参考 [文档](https://example.com)",              "参考 文档"),
+        # Parens-wrapped English (any length) after Chinese
+        ("阿森纳 (Arsenal)",                              "阿森纳"),
+        ("巴黎圣日耳曼 (Paris Saint-Germain, PSG)",       "巴黎圣日耳曼"),
+        # English short ticker after Chinese phrase
+        ("苹果公司 AAPL 涨了",                            "苹果公司 涨了"),
+        # Dates: M/D and Y/M/D — slash or dash separator
+        ("决赛定于 5/31 举行",                            "决赛定于 5月31日 举行"),
+        ("活动是 2026/5/31 的事",                         "活动是 2026年5月31日 的事"),
+        ("11-30 截止",                                    "11月30日 截止"),
         # Plain numbers must SURVIVE — only confident patterns strip
-        ("2026 年第一季度",        "2026 年第一季度"),
-        ("营收增长 25%",           "营收增长 25%"),
-        ("第 (1) 项",              "第 (1) 项"),     # bullet number not after Chinese run
-        ("",                       ""),
+        ("2026 年第一季度",                               "2026 年第一季度"),
+        ("营收增长 25%",                                  "营收增长 25%"),
+        ("第 (1) 项",                                     "第 (1) 项"),
+        # The user-reported end-to-end case
+        (
+            "参考来源:- [欧冠赛程 - 5/31决赛](https://tw.trip.com/blog/uefa-champions/)",
+            "参考来源:- 欧冠赛程 - 5月31日决赛",
+        ),
+        ("",                                              ""),
     ])
     def test_golden(self, inp, out):
         assert strip_tts_unfriendly(inp) == out
+
+
+class TestStripTerminatedLinksAndUrls:
+    """Buffer-level stripper called per-delta in the chat pipeline.
+    Only strips patterns that have at least one char after them — so a
+    growing buffer doesn't pre-eat a URL while more chars are still
+    arriving."""
+
+    def test_complete_md_link_with_trailing_text_stripped(self):
+        assert (
+            strip_terminated_links_and_urls("see [docs](http://x.com) please")
+            == "see docs please"
+        )
+
+    def test_md_link_at_end_left_alone(self):
+        """Right at end of buffer — might still be growing. Don't strip."""
+        assert (
+            strip_terminated_links_and_urls("see [docs](http://x.com)")
+            == "see [docs](http://x.com)"
+        )
+
+    def test_complete_url_with_trailing_text_stripped(self):
+        assert (
+            strip_terminated_links_and_urls("访问 https://example.com 即可")
+            == "访问  即可"
+        )
+
+    def test_url_at_end_left_alone(self):
+        assert (
+            strip_terminated_links_and_urls("访问 https://example.com")
+            == "访问 https://example.com"
+        )
+
+    def test_partial_md_link_no_change(self):
+        assert strip_terminated_links_and_urls("see [doc") == "see [doc"
+        assert strip_terminated_links_and_urls("see [doc](http") == "see [doc](http"
+
+    def test_empty(self):
+        assert strip_terminated_links_and_urls("") == ""
 
 
 class TestPcmFloatToWavBytes:

@@ -38,7 +38,7 @@ import logging
 import time
 from typing import Awaitable, Callable, Optional
 
-from .audio import pop_speakable, strip_tts_unfriendly
+from .audio import pop_speakable, strip_terminated_links_and_urls, strip_tts_unfriendly
 from .config import settings
 from .polish import polish_text
 from .providers import get_llm, get_tts
@@ -152,6 +152,12 @@ async def run_chat_pipeline(
                 full_text += delta
                 text_buf += delta
                 await emit("token", {"delta": delta})
+                # Strip terminated URLs / markdown links from the buffer
+                # BEFORE the sentence splitter sees it — so the splitter
+                # doesn't accidentally cut inside a URL on the ``.``
+                # between ``tw.trip``. Partial constructs (still being
+                # typed) survive until they close.
+                text_buf = strip_terminated_links_and_urls(text_buf)
                 while True:
                     chunk, rest = pop_speakable(
                         text_buf, force=False, is_first=first_chunk_pending,
