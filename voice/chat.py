@@ -43,7 +43,14 @@ from .config import settings
 from .polish import polish_text
 from .providers import get_llm, get_tts
 from .providers.llm import reset_ablework_session
-from .runtime import mlx_call
+from .runtime import (
+    RETRY_ATTEMPTS,
+    RETRY_FACTOR,
+    RETRY_INITIAL_DELAY,
+    is_retryable_error,
+    mlx_call,
+    with_retries,
+)
 
 logger = logging.getLogger("voice.chat")
 
@@ -132,8 +139,16 @@ async def run_chat_pipeline(
     async def llm_task() -> None:
         nonlocal text_buf, full_text
         first_chunk_pending = True
-        try:
+        yielded_any = False
+
+        async def _consume_one_stream() -> None:
+            """One full pass through the upstream LLM stream. Sets
+            ``yielded_any`` on the first delta so the retry loop knows
+            it can no longer safely retry (retrying mid-stream would
+            duplicate tokens the user already saw)."""
+            nonlocal first_chunk_pending, full_text, text_buf, yielded_any
             async for delta in llm.stream(payload_messages, session_id):
+                yielded_any = True
                 full_text += delta
                 text_buf += delta
                 await emit("token", {"delta": delta})
@@ -149,6 +164,37 @@ async def run_chat_pipeline(
             if text_buf.strip():
                 await tts_q.put(text_buf)
                 text_buf = ""
+
+        try:
+            # Retry the initial connect / first-response when the upstream
+            # gives a transient failure (e.g. ablework nginx 502 during
+            # an upstream restart). Once tokens start flowing we don't
+            # retry — that would duplicate output the user already saw.
+            delay = RETRY_INITIAL_DELAY
+            for attempt in range(1, RETRY_ATTEMPTS + 1):
+                try:
+                    await _consume_one_stream()
+                    break
+                except BaseException as exc:
+                    if (
+                        yielded_any
+                        or attempt >= RETRY_ATTEMPTS
+                        or not is_retryable_error(exc)
+                    ):
+                        raise
+                    await emit("retry", {
+                        "where": "llm",
+                        "attempt": attempt,
+                        "max_attempts": RETRY_ATTEMPTS,
+                        "wait_ms": int(delay * 1000),
+                        "reason": f"{type(exc).__name__}: {str(exc)[:80]}",
+                    })
+                    logger.warning(
+                        "LLM retry attempt=%d/%d after %s — waiting %.1fs",
+                        attempt, RETRY_ATTEMPTS, type(exc).__name__, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= RETRY_FACTOR
         finally:
             await tts_q.put(None)
 
@@ -163,8 +209,23 @@ async def run_chat_pipeline(
             # client in ``text`` so the UI shows the LLM's actual output.
             spoken = strip_tts_unfriendly(sent)
             t0 = time.monotonic()
+
+            def _notify_tts_retry(att: int, exc: BaseException, dly: float) -> None:
+                # ``on_retry`` is sync; schedule the emit as a side task
+                # so the retry loop can keep timing.
+                asyncio.create_task(emit("retry", {
+                    "where": "tts",
+                    "attempt": att,
+                    "max_attempts": RETRY_ATTEMPTS,
+                    "wait_ms": int(dly * 1000),
+                    "reason": f"{type(exc).__name__}: {str(exc)[:80]}",
+                }))
+
             try:
-                wav_bytes, sr, n_samples = await tts.synth(spoken, voice=voice_override)
+                wav_bytes, sr, n_samples = await with_retries(
+                    lambda: tts.synth(spoken, voice=voice_override),
+                    on_retry=_notify_tts_retry,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("tts_task failed for: %r", sent[:80])
                 await emit("error", {"message": f"TTS: {exc}"})

@@ -38,7 +38,7 @@ from typing import Awaitable, Callable, Optional
 import websockets as _wspkg
 
 from ..config import settings
-from ..runtime import mlx_call
+from ..runtime import mlx_call, with_retries
 
 logger = logging.getLogger("voice.providers.asr")
 
@@ -148,37 +148,46 @@ class DashscopeRealtimeAsr:
     async def start(self) -> None:
         if not settings.dashscope.api_key:
             raise RuntimeError("ASR_PROVIDER=dashscope but DASHSCOPE_API_KEY not set")
-        sslctx = ssl.create_default_context()
-        sslctx.check_hostname = False
-        sslctx.verify_mode = ssl.CERT_NONE
-        self._ws = await _wspkg.connect(
-            settings.dashscope.asr_ws_url,
-            additional_headers={
-                "Authorization": f"bearer {settings.dashscope.api_key}",
-                "X-DashScope-DataInspection": "enable",
-            },
-            ssl=sslctx,
-            max_size=None,
-        )
-        await self._ws.send(json.dumps({
-            "header": {"action": "run-task", "task_id": self._task_id, "streaming": "duplex"},
-            "payload": {
-                "task_group": "audio",
-                "task": "asr",
-                "function": "recognition",
-                "model": settings.dashscope.asr_model,
-                "parameters": {
-                    "sample_rate": self._sr,
-                    "format": "pcm",
-                    "language_hints": [settings.dashscope.asr_lang],
+
+        async def _attempt() -> None:
+            sslctx = ssl.create_default_context()
+            sslctx.check_hostname = False
+            sslctx.verify_mode = ssl.CERT_NONE
+            self._ws = await _wspkg.connect(
+                settings.dashscope.asr_ws_url,
+                additional_headers={
+                    "Authorization": f"bearer {settings.dashscope.api_key}",
+                    "X-DashScope-DataInspection": "enable",
                 },
-                "input": {},
-            },
-        }))
-        self._reader_task = asyncio.create_task(self._reader(), name="ds-asr-reader")
-        # Block briefly until upstream confirms task-started — otherwise
-        # the first PCM frames would race the run-task and be dropped.
-        await asyncio.wait_for(self._started.wait(), timeout=5)
+                ssl=sslctx,
+                max_size=None,
+            )
+            # Fresh started Event per attempt — a prior attempt that
+            # almost-succeeded shouldn't poison the next one.
+            self._started = asyncio.Event()
+            self._finished = asyncio.Event()
+            await self._ws.send(json.dumps({
+                "header": {"action": "run-task", "task_id": self._task_id, "streaming": "duplex"},
+                "payload": {
+                    "task_group": "audio",
+                    "task": "asr",
+                    "function": "recognition",
+                    "model": settings.dashscope.asr_model,
+                    "parameters": {
+                        "sample_rate": self._sr,
+                        "format": "pcm",
+                        "language_hints": [settings.dashscope.asr_lang],
+                    },
+                    "input": {},
+                },
+            }))
+            self._reader_task = asyncio.create_task(self._reader(), name="ds-asr-reader")
+            # Block briefly until upstream confirms task-started —
+            # otherwise the first PCM frames would race the run-task
+            # and be dropped. wait_for TimeoutError is retryable.
+            await asyncio.wait_for(self._started.wait(), timeout=5)
+
+        await with_retries(_attempt)
 
     async def _reader(self) -> None:
         try:

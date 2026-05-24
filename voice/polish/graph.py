@@ -40,6 +40,7 @@ from typing import Any
 from langgraph.graph import END, StateGraph
 
 from ..config import settings
+from ..runtime import with_retries
 from .classify import classify
 from .llm import run_polish
 from .prompts import build_messages, build_retry_messages
@@ -68,7 +69,11 @@ async def polish_node(state: PolishState) -> dict[str, Any]:
         errs = state.get("validation", {}).get("errors", [])
         messages = build_retry_messages(state["raw"], cls, prev, errs)
     try:
-        out = await run_polish(messages)
+        # Network-level transient retries (5xx / timeout / connection-
+        # reset). Different from the graph's validate-fail retry loop:
+        # this only handles "the request never landed", not "the model
+        # returned something we don't like".
+        out = await with_retries(lambda: run_polish(messages))
     except Exception as exc:  # noqa: BLE001
         logger.exception("polish LLM call failed (attempt %d)", attempts + 1)
         return {"error": f"{type(exc).__name__}: {exc}", "attempts": attempts + 1}

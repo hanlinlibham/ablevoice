@@ -155,6 +155,7 @@ class VoiceTUI(App):
                 "audio_chunk":         self._h_audio_chunk,
                 "chat_done":           self._h_chat_done,
                 "interrupted":         self._h_interrupted,
+                "retry":               self._h_retry,
                 "tts_done":            self._h_noop,
                 "history_reset":       self._h_history_reset,
                 "error":               self._h_error,
@@ -359,6 +360,22 @@ class VoiceTUI(App):
         status.chatting = False
         status.polishing = False
         self.partial_user_idx = None
+
+    async def _h_retry(self, ev: dict) -> None:
+        """Server retried a transient upstream failure (5xx / connection
+        reset). Show it inline so the user understands the brief stall."""
+        where = ev.get("where", "?")
+        attempt = ev.get("attempt", "?")
+        maxn = ev.get("max_attempts", "?")
+        reason = ev.get("reason", "")
+        wait_ms = ev.get("wait_ms", 0)
+        # Truncate reason in case the server returned an HTML 502 page
+        # — first line is usually enough to diagnose.
+        short_reason = reason.split("\n", 1)[0][:80]
+        self._sys(
+            f"[yellow]⟳ {where} 重试 {attempt}/{maxn} ({wait_ms}ms 后)"
+            f"  原因:{short_reason}[/yellow]"
+        )
 
     async def _h_history_reset(self, ev: dict) -> None:
         conv = self.query_one("#conv", Conversation)
