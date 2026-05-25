@@ -24,6 +24,27 @@ from __future__ import annotations
 from typing import AsyncIterator, Awaitable, Callable, Optional, Protocol
 
 
+class TtsStreamSession(Protocol):
+    """One streaming TTS session — only meaningful for providers that
+    support a duplex protocol (DashScope Realtime WS today). The chat
+    pipeline opens one session per LLM turn, feeds token deltas via
+    ``append``, drains PCM via ``audio_frames``, and tears down with
+    ``finish`` (graceful) or ``cancel`` (abrupt, on interrupt).
+
+    Audio frames are int16 LE mono PCM at ``sample_rate`` — callers wrap
+    in a WAV header for client playback parity with the one-shot path."""
+
+    async def open(self) -> None: ...
+    async def append(self, text_delta: str) -> None: ...
+    async def finish(self) -> None: ...
+    async def cancel(self) -> None: ...
+
+    def audio_frames(self) -> AsyncIterator[bytes]: ...
+
+    @property
+    def sample_rate(self) -> int: ...
+
+
 class AsrSession(Protocol):
     """One session per recording window. Provider chooses how to manage
     upstream state (MLX in-memory; DashScope keeps an upstream WS)."""
@@ -43,7 +64,10 @@ LlmStream = Callable[[list[dict], str], AsyncIterator[str]]
 
 
 class LlmProvider(Protocol):
-    def stream(self, messages: list[dict], session_id: str) -> AsyncIterator[str]: ...
+    def stream(
+        self, messages: list[dict], session_id: str,
+        *, workspace_id: str | None = None,
+    ) -> AsyncIterator[str]: ...
 
     @property
     def model_id(self) -> str: ...
@@ -55,9 +79,16 @@ class TtsProvider(Protocol):
 
     ``voice`` overrides the configured default for this single call —
     callers (chat pipeline / WS handler) thread per-session voice
-    settings through without mutating global config."""
+    settings through without mutating global config.
+
+    ``stream`` returns a ``TtsStreamSession`` for duplex providers
+    (currently only DashScope Realtime WS), or ``None`` for one-shot
+    providers (MLX local, DashScope HTTP). The chat pipeline checks for
+    None and falls back to the per-sentence ``synth()`` path."""
 
     async def synth(self, text: str, *, voice: str | None = None) -> tuple[bytes, int, int]: ...
+
+    def stream(self, *, voice: str | None = None) -> Optional[TtsStreamSession]: ...
 
     @property
     def model_id(self) -> str: ...
@@ -98,6 +129,12 @@ def get_llm() -> LlmProvider:
 def get_tts() -> TtsProvider:
     from ..config import settings
     if settings.tts.provider == "dashscope":
+        # Dispatch on the model name: ``*realtime*`` → WS streaming,
+        # else the HTTP one-shot path. Lets users A/B without flipping
+        # ``TTS_PROVIDER``.
+        if settings.dashscope.tts_is_realtime:
+            from .tts import DashscopeRealtimeTts
+            return DashscopeRealtimeTts()
         from .tts import DashscopeTts
         return DashscopeTts()
     from .tts import MlxTts

@@ -22,6 +22,9 @@ def _reload(monkeypatch, **env):
         "ASR_PROVIDER", "LLM_PROVIDER", "TTS_PROVIDER", "POLISH_PROVIDER",
         "MLX_QWEN_MODEL", "MLX_TTS_VOICE", "KEEP_AUDIO", "WARMUP",
         "DASHSCOPE_API_KEY", "ABLEWORK_TOKEN",
+        "DASHSCOPE_TTS_MODEL", "DASHSCOPE_TTS_REALTIME_MODE",
+        "TTS_SPEECH_RATE", "TTS_PITCH_RATE", "TTS_VOLUME",
+        "TTS_RESPONSE_FORMAT", "TTS_BIT_RATE",
         "SYSTEM_PROMPT", "SYSTEM_PROMPT_FILE",
         "CHAT_SENT_SOFT_CAP", "MLX_TTS_TEMPERATURE",
     ]:
@@ -63,6 +66,28 @@ def test_active_model_id_dispatches(monkeypatch):
     assert cfg.settings.asr_active_model_id == cfg.settings.dashscope.asr_model
     cfg = _reload(monkeypatch, ASR_PROVIDER="mlx")
     assert cfg.settings.asr_active_model_id == cfg.settings.asr.mlx_model
+
+
+def test_tts_realtime_dispatch_by_model_name(monkeypatch):
+    """``tts_is_realtime`` is what get_tts() branches on. Verify both
+    halves of the substring match."""
+    cfg = _reload(monkeypatch, DASHSCOPE_TTS_MODEL="qwen3-tts-flash-realtime")
+    assert cfg.settings.dashscope.tts_is_realtime is True
+    cfg = _reload(monkeypatch, DASHSCOPE_TTS_MODEL="qwen3-tts-instruct-flash")
+    assert cfg.settings.dashscope.tts_is_realtime is False
+
+
+def test_tts_audio_param_validation(monkeypatch):
+    with pytest.raises(RuntimeError, match="TTS_SPEECH_RATE"):
+        _reload(monkeypatch, TTS_SPEECH_RATE="3.0")
+    with pytest.raises(RuntimeError, match="TTS_PITCH_RATE"):
+        _reload(monkeypatch, TTS_PITCH_RATE="0.1")
+    with pytest.raises(RuntimeError, match="TTS_VOLUME"):
+        _reload(monkeypatch, TTS_VOLUME="150")
+    with pytest.raises(RuntimeError, match="TTS_RESPONSE_FORMAT"):
+        _reload(monkeypatch, TTS_RESPONSE_FORMAT="flac")
+    with pytest.raises(RuntimeError, match="DASHSCOPE_TTS_REALTIME_MODE"):
+        _reload(monkeypatch, DASHSCOPE_TTS_REALTIME_MODE="auto")
 
 
 def test_token_legacy_alias_removed(monkeypatch):

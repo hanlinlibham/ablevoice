@@ -159,6 +159,11 @@ class VoiceTUI(App):
                 "tts_done":            self._h_noop,
                 "history_reset":       self._h_history_reset,
                 "error":               self._h_error,
+                "workspace_list":      self._h_workspace_list,
+                "workspace_changed":   self._h_workspace_changed,
+                "intent_ack":          self._h_intent_ack,
+                "voice_set":           self._h_noop,
+                "polish_set":          self._h_noop,
             },
             on_status=self._on_ws_status,
             on_drafts_available=self._on_drafts_available,
@@ -360,6 +365,43 @@ class VoiceTUI(App):
         status.chatting = False
         status.polishing = False
         self.partial_user_idx = None
+
+    async def _h_workspace_list(self, ev: dict) -> None:
+        """Server pushes the workspace list at hello time + on refresh.
+        Update StatusBar's workspace_name with the current active one.
+        Also cache the list so a future 'show me workspaces' UI can use
+        it without re-fetching."""
+        try:
+            status = self.query_one("#status", StatusBar)
+        except Exception:
+            return
+        current_name = ev.get("current_name") or ""
+        status.workspace_name = current_name
+        rows = ev.get("workspaces", [])
+        if rows:
+            n = len(rows)
+            tag = f" ({current_name})" if current_name else ""
+            self._sys(f"[dim]工作区已加载:{n} 个{tag}[/dim]")
+
+    async def _h_workspace_changed(self, ev: dict) -> None:
+        """A workspace op (set_workspace / ws_switch / ws_create / ws_move
+        / ws_leave) completed. Update StatusBar."""
+        try:
+            status = self.query_one("#status", StatusBar)
+        except Exception:
+            return
+        name = ev.get("name") or ""
+        status.workspace_name = name
+
+    async def _h_intent_ack(self, ev: dict) -> None:
+        """Server handled an intent — show the ack text as a system
+        message. The associated TTS audio comes via audio_chunk
+        (handled separately)."""
+        intent = ev.get("intent", "?")
+        text = ev.get("text", "")
+        ms = ev.get("ms_classify", 0) + ev.get("ms_handle", 0)
+        if text:
+            self._sys(f"[magenta bold]✦ {intent}[/magenta bold] {text}  [dim]({ms}ms)[/dim]")
 
     async def _h_retry(self, ev: dict) -> None:
         """Server retried a transient upstream failure (5xx / connection

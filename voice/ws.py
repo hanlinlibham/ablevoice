@@ -45,13 +45,18 @@ from typing import Optional
 
 from fastapi import WebSocket
 
+import base64
+
 from . import db
 from .chat import reset_conversation, run_chat_pipeline
 from .chat import synth_one
 from .config import settings
+from .intents import process_intent
+from .intents.workspace_cache import WorkspaceCache
 from .polish import polish_text
 from .providers import get_asr
 from .providers.base import AsrSession
+from .providers.llm import reset_ablework_session
 from .storage import DraftRecorder
 
 logger = logging.getLogger("voice.ws")
@@ -79,6 +84,12 @@ class WsSession:
         self.voice_override: Optional[str] = None
         self.tts_provider_override: Optional[str] = None  # "mlx" | "dashscope"
         self.polish_override: Optional[bool] = None       # None = use global default
+        # Per-session workspace state — voice intent classifier (or
+        # explicit set_workspace WS event) sets workspace_override; cache
+        # is the list of available workspaces fetched at hello-time and
+        # refreshed on demand.
+        self.workspace_override: Optional[str] = None
+        self.cache = WorkspaceCache()
 
     async def send_json(self, obj: dict) -> None:
         async with self._send_lock:
@@ -102,6 +113,72 @@ class WsSession:
         logger.info("chat interrupted (%s) session=%s", reason,
                     (self.session_id or "?")[:8])
 
+    async def _emit_intent_ack(self, result) -> None:
+        """Send a workspace-changed + intent_ack pair, then TTS the
+        ack_text. The TUI plays the audio through its normal audio_chunk
+        path so user hears the ack like a chat reply."""
+        # 1. Structural event — UI status bar updates from this
+        ws = self.cache.by_id(self.workspace_override) if self.workspace_override else None
+        await self.send_json({
+            "type": "workspace_changed",
+            "id": self.workspace_override,
+            "name": (ws or {}).get("name") if ws else None,
+            "intent": result.intent.value,
+            "ok": result.error is None,
+            "error": result.error,
+        })
+        # 2. Text + meta — for UI display
+        await self.send_json({
+            "type": "intent_ack",
+            "intent": result.intent.value,
+            "text": result.ack_text or "",
+            "workspace_id": result.workspace_id,
+            "workspace_match": result.workspace_match,
+            "ms_classify": result.ms_classify,
+            "ms_handle": result.ms_handle,
+        })
+        # 3. Speak it. synth_one runs through normal MLX worker / cloud
+        # TTS path. Failures are non-fatal — the text message above
+        # already conveys the info, audio is just an enhancement.
+        ack = (result.ack_text or "").strip()
+        if not ack:
+            return
+        try:
+            from .audio import strip_tts_unfriendly
+            wav_bytes, sr, n_samples = await synth_one(
+                strip_tts_unfriendly(ack), voice=self.voice_override,
+            )
+            if not wav_bytes:
+                return
+            dur_ms = int(1000 * n_samples / sr) if n_samples and sr else 0
+            b64 = base64.b64encode(wav_bytes).decode("ascii")
+            await self.send_json({
+                "type": "audio_chunk", "text": ack, "b64": b64,
+                "dur_ms": dur_ms, "synth_ms": 0, "idx": 0,
+            })
+        except Exception:
+            logger.exception("intent ack TTS failed (text was sent already)")
+
+    # --- SessionCtx adapter (for voice.intents.handlers) -------------------
+
+    def get_workspace_override(self) -> Optional[str]:
+        return self.workspace_override
+
+    def set_workspace_override(self, ws_id: Optional[str]) -> None:
+        self.workspace_override = ws_id
+
+    def reset_conversation(self) -> int:
+        """Full local + ablework conv reset — for ws_switch / ws_create
+        / ws_leave handlers."""
+        return reset_conversation(self.session_id or "")
+
+    def reset_ablework_session_only(self) -> None:
+        """Only clear the ablework-side conv_id — keep local
+        ``_conversations[session_id]`` history so the UI still shows it.
+        Used by ws_move so the user sees their previous turns continuing
+        in the new workspace."""
+        reset_ablework_session(self.session_id or "")
+
     # --- ready frame --------------------------------------------------------
 
     async def send_ready(self) -> None:
@@ -122,6 +199,38 @@ class WsSession:
     async def handle_hello(self, ev: dict) -> None:
         self.session_id = str(ev.get("session_id") or uuid.uuid4().hex)
         logger.info("ws hello session=%s", self.session_id[:8])
+        # If env default workspace is set, seed the override so the
+        # first chat lands there (the user can override later via voice).
+        if not self.workspace_override and settings.ablework.default_workspace_id:
+            self.workspace_override = settings.ablework.default_workspace_id
+        # Fetch workspace list in the background — used by the intent
+        # classifier for fuzzy matching + by the TUI status bar. We
+        # don't block hello on this; cache lazy-fills if first intent
+        # arrives before fetch completes.
+        asyncio.create_task(self._bootstrap_workspaces(), name="ws-bootstrap")
+
+    async def _bootstrap_workspaces(self) -> None:
+        """Fetch workspaces, populate cache, send workspace_list event
+        to TUI so status bar shows current ws name. Non-fatal — logs
+        on failure (might happen if token expired or ablework down)."""
+        if not settings.ablework.has_token:
+            return
+        try:
+            await self.cache.refresh()
+        except Exception:
+            logger.exception("workspace bootstrap failed")
+            return
+        current = self.cache.by_id(self.workspace_override) if self.workspace_override else None
+        await self.send_json({
+            "type": "workspace_list",
+            "workspaces": [
+                {"id": w.get("id"), "name": w.get("name"),
+                 "last_active_at": w.get("last_active_at")}
+                for w in self.cache.workspaces
+            ],
+            "current_id": self.workspace_override,
+            "current_name": (current or {}).get("name") if current else None,
+        })
 
     async def handle_start_recording(self, ev: dict) -> None:
         # Implicit interrupt if a chat is still streaming.
@@ -324,6 +433,20 @@ class WsSession:
             else said
         )
 
+        # ---- Intent classification (workspace ops via voice) ----------
+        # Runs on the polished text. If user said "切到 X" / "新建 X" /
+        # etc, ``process_intent`` handles it directly (speaks ack via
+        # TTS, emits workspace_changed event) and we skip the chat
+        # pipeline for this turn. Plain chat falls through.
+        try:
+            intent_result = await process_intent(polish_result.final, self)
+        except Exception:
+            logger.exception("process_intent crashed — falling through to chat")
+            intent_result = None
+        if intent_result is not None and intent_result.handled:
+            await self._emit_intent_ack(intent_result)
+            return
+
         # Spawn chat — cancellable via interrupt/new_recording. Pass
         # ``polished_text`` so chat.py doesn't repeat the polish call.
         sid = self.session_id
@@ -333,11 +456,14 @@ class WsSession:
             await self.send_json(payload)
         # Pass voice override down so MLX TTS picks the right speaker
         # for this session. None means "use settings.tts.voice default".
+        # workspace_id: per-session override > env default > none.
+        effective_ws = self.workspace_override or settings.ablework.default_workspace_id
         self.chat_task = asyncio.create_task(
             run_chat_pipeline(
                 sid, said, emit,
                 polished_text=chat_input,
                 voice_override=self.voice_override,
+                workspace_id=effective_ws or None,
             ),
             name=f"chat-{sid[:8]}",
         )
@@ -416,17 +542,50 @@ class WsSession:
                         else self.polish_override),
         })
 
+    async def handle_set_workspace(self, ev: dict) -> None:
+        """Per-session workspace override — for TUI hotkey + reconnect
+        replay. Empty / null id clears to default (env-level).
+
+        Does NOT reset the conversation (caller already chose this) and
+        does NOT touch the workspace remotely (caller can use ws_switch
+        voice intent if they want both)."""
+        new_id = (ev.get("id") or "").strip() or None
+        self.workspace_override = new_id
+        logger.info(
+            "ws set_workspace session=%s workspace=%r",
+            (self.session_id or "?")[:8], new_id,
+        )
+        # Resolve name from cache for ack — refresh once if not loaded
+        if not self.cache.loaded:
+            await self.cache.refresh()
+        ws = self.cache.by_id(new_id) if new_id else None
+        await self.send_json({
+            "type": "workspace_changed",
+            "id": new_id,
+            "name": (ws or {}).get("name") if ws else None,
+            "intent": "set_workspace",
+            "ok": True,
+            "error": None,
+        })
+
+    async def handle_refresh_workspaces(self, ev: dict) -> None:
+        """Client-triggered refresh — re-fetch ablework /workspaces and
+        emit a fresh workspace_list event."""
+        await self._bootstrap_workspaces()
+
     # --- main loop ---------------------------------------------------------
 
     HANDLERS = {
-        "hello":           "handle_hello",
-        "start_recording": "handle_start_recording",
-        "stop_recording":  "handle_stop_recording",
-        "interrupt":       "handle_interrupt",
-        "tts":             "handle_tts",
-        "reset":           "handle_reset",
-        "set_voice":       "handle_set_voice",
-        "set_polish":      "handle_set_polish",
+        "hello":              "handle_hello",
+        "start_recording":    "handle_start_recording",
+        "stop_recording":     "handle_stop_recording",
+        "interrupt":          "handle_interrupt",
+        "tts":                "handle_tts",
+        "reset":              "handle_reset",
+        "set_voice":          "handle_set_voice",
+        "set_polish":         "handle_set_polish",
+        "set_workspace":      "handle_set_workspace",
+        "refresh_workspaces": "handle_refresh_workspaces",
     }
 
     async def run(self) -> None:

@@ -80,8 +80,10 @@ class DashscopeConfig:
     asr_ws_url: str
     chat_model: str        # "qwen3.7-max"
     chat_thinking: bool    # leave off for voice (kills first-audio latency)
-    tts_model: str         # "qwen3-tts-instruct-flash" | "qwen3-tts-flash"
-    tts_url: str
+    tts_model: str         # realtime: "qwen3-tts-flash-realtime" / "qwen3-tts-instruct-flash-realtime"; http: "qwen3-tts-instruct-flash"
+    tts_url: str           # HTTP one-shot endpoint
+    tts_realtime_url: str  # WS realtime endpoint (used when tts_model contains "realtime")
+    tts_realtime_mode: str # "server_commit" (default, server auto-segments) | "commit" (client-driven)
     tts_lang: str          # "Chinese" (note Title-case for dashscope)
     polish_model: str      # "qwen-flash" — cheaper model good enough for polish
 
@@ -89,15 +91,24 @@ class DashscopeConfig:
     def has_key(self) -> bool:
         return bool(self.api_key)
 
+    @property
+    def tts_is_realtime(self) -> bool:
+        return "realtime" in self.tts_model.lower()
+
 
 @dataclass(frozen=True)
 class AblewerkConfig:
     """Ablework backend creds + URL. The token is JWT-shaped (long).
     SSL verify defaults off because the corp proxy MITMs with a
-    self-signed CA; flip on if your CA is in the system trust store."""
+    self-signed CA; flip on if your CA is in the system trust store.
+
+    ``default_workspace_id`` is the env-level fallback used when no
+    per-session override is set (via voice ws_switch / hotkey). Leave
+    empty → ablework backend's legacy per-thread sandbox."""
     url: str
     token: str
     verify_ssl: bool
+    default_workspace_id: str
 
     @property
     def has_token(self) -> bool:
@@ -158,6 +169,13 @@ class TtsConfig:
     seed: int
     instruct: str
     ref_text: str
+    # Realtime fine-grain controls (DashScope Realtime WS only — HTTP
+    # `qwen3-tts-instruct-flash` ignores these silently).
+    speech_rate: float     # 0.5~2.0, 1.0 = normal
+    pitch_rate: float      # 0.5~2.0, 1.0 = normal
+    volume: int            # 0~100, default 50
+    bit_rate: int          # 6~510 kbps (opus only)
+    response_format: str   # "pcm" | "wav" | "mp3" | "opus" — realtime WS output
     # Post-processing (used by both providers)
     target_rms: float
     max_gain: float
@@ -185,6 +203,27 @@ class PolishConfig:
     max_tokens: int
     temperature: float
     max_attempts: int
+
+
+@dataclass(frozen=True)
+class IntentConfig:
+    """Voice intent classifier — routes polished user text to either
+    chat (default) or one of the ws_* operations.
+
+    ``provider``: only ``dashscope`` for now (qwen-flash via OAI-compat).
+    ``ds_model``: which model. Bake-off picked ``qwen-flash`` (TTFT
+    ~440ms,total ~510ms,14/14 quality on intent test set).
+    ``min_confidence``: classifier outputs <below default to CHAT so
+    a borderline misclassification doesn't silently swallow a real
+    question.
+    ``pre_filter``: regex check before LLM. With it on, only inputs
+    containing workspace keywords pay LLM latency — vast majority
+    of normal chat turns skip the classify call entirely."""
+    enabled: bool
+    provider: str          # "dashscope" (only supported for now)
+    ds_model: str          # e.g. "qwen-flash"
+    min_confidence: float
+    pre_filter: bool
 
 
 @dataclass(frozen=True)
@@ -217,6 +256,7 @@ class Settings:
     llm: LlmConfig
     tts: TtsConfig
     polish: PolishConfig
+    intent: IntentConfig
     sentence: SentenceConfig
     storage: StorageConfig
     warmup: bool
@@ -301,11 +341,16 @@ def _load() -> Settings:
             ),
             chat_model=_env_str("DASHSCOPE_MODEL", "qwen3.7-max"),
             chat_thinking=_env_bool("DASHSCOPE_THINKING", False),
-            tts_model=_env_str("DASHSCOPE_TTS_MODEL", "qwen3-tts-instruct-flash"),
+            tts_model=_env_str("DASHSCOPE_TTS_MODEL", "qwen3-tts-flash-realtime"),
             tts_url=_env_str(
                 "DASHSCOPE_TTS_URL",
                 "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
             ),
+            tts_realtime_url=_env_str(
+                "DASHSCOPE_TTS_REALTIME_URL",
+                "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+            ),
+            tts_realtime_mode=_env_str("DASHSCOPE_TTS_REALTIME_MODE", "server_commit"),
             tts_lang=_env_str("DASHSCOPE_TTS_LANG", "Chinese"),
             polish_model=_env_str("POLISH_DASHSCOPE_MODEL", "qwen-flash"),
         ),
@@ -313,6 +358,7 @@ def _load() -> Settings:
             url=_env_str("ABLEWORK_URL", "https://ab.itseek.cc/api/chat"),
             token=_env_str("ABLEWORK_TOKEN", ""),
             verify_ssl=_env_bool("ABLEWORK_VERIFY_SSL", False),
+            default_workspace_id=_env_str("ABLEWORK_WORKSPACE_ID", ""),
         ),
         ollama=OllamaConfig(
             url=_env_str("OLLAMA_URL", "http://127.0.0.1:11434"),
@@ -347,6 +393,11 @@ def _load() -> Settings:
             ref_text=_env_str(
                 "MLX_TTS_REF_TEXT", "你好,我是一个语音助手,很高兴为你服务。"
             ),
+            speech_rate=_env_float("TTS_SPEECH_RATE", 1.0),
+            pitch_rate=_env_float("TTS_PITCH_RATE", 1.0),
+            volume=_env_int("TTS_VOLUME", 50),
+            bit_rate=_env_int("TTS_BIT_RATE", 128),
+            response_format=_env_str("TTS_RESPONSE_FORMAT", "pcm"),
             target_rms=_env_float("MLX_TTS_TARGET_RMS", 0.12),
             max_gain=_env_float("MLX_TTS_MAX_GAIN", 4.0),
             trim_dbfs=_env_float("MLX_TTS_TRIM_DBFS", -40),
@@ -360,6 +411,13 @@ def _load() -> Settings:
             max_tokens=_env_int("POLISH_MAX_TOKENS", 256),
             temperature=_env_float("POLISH_TEMPERATURE", 0.2),
             max_attempts=_env_int("POLISH_MAX_ATTEMPTS", 2),
+        ),
+        intent=IntentConfig(
+            enabled=_env_bool("INTENT_ENABLED", True),
+            provider=_env_str("INTENT_PROVIDER", "dashscope").lower(),
+            ds_model=_env_str("INTENT_DASHSCOPE_MODEL", "qwen-flash"),
+            min_confidence=_env_float("INTENT_MIN_CONFIDENCE", 0.7),
+            pre_filter=_env_bool("INTENT_PRE_FILTER", True),
         ),
         sentence=SentenceConfig(
             min_chars=_env_int("CHAT_SENT_MIN_CHARS", 6),
@@ -388,6 +446,8 @@ def _validate(s: Settings) -> None:
     valid_llm = {"mlx", "ollama", "dashscope", "ablework"}
     valid_tts = {"mlx", "dashscope"}
     valid_polish = {"mlx", "dashscope", "off"}
+    valid_rt_modes = {"server_commit", "commit"}
+    valid_rt_formats = {"pcm", "wav", "mp3", "opus"}
     if s.asr.provider not in valid_asr:
         raise RuntimeError(f"ASR_PROVIDER={s.asr.provider!r} not in {valid_asr}")
     if s.llm.provider not in valid_llm:
@@ -396,6 +456,21 @@ def _validate(s: Settings) -> None:
         raise RuntimeError(f"TTS_PROVIDER={s.tts.provider!r} not in {valid_tts}")
     if s.polish.provider not in valid_polish:
         raise RuntimeError(f"POLISH_PROVIDER={s.polish.provider!r} not in {valid_polish}")
+    if s.dashscope.tts_realtime_mode not in valid_rt_modes:
+        raise RuntimeError(
+            f"DASHSCOPE_TTS_REALTIME_MODE={s.dashscope.tts_realtime_mode!r} "
+            f"not in {valid_rt_modes}"
+        )
+    if s.tts.response_format not in valid_rt_formats:
+        raise RuntimeError(
+            f"TTS_RESPONSE_FORMAT={s.tts.response_format!r} not in {valid_rt_formats}"
+        )
+    if not (0.5 <= s.tts.speech_rate <= 2.0):
+        raise RuntimeError(f"TTS_SPEECH_RATE={s.tts.speech_rate} not in [0.5, 2.0]")
+    if not (0.5 <= s.tts.pitch_rate <= 2.0):
+        raise RuntimeError(f"TTS_PITCH_RATE={s.tts.pitch_rate} not in [0.5, 2.0]")
+    if not (0 <= s.tts.volume <= 100):
+        raise RuntimeError(f"TTS_VOLUME={s.tts.volume} not in [0, 100]")
 
     needs_dashscope = (
         (s.asr.provider == "dashscope") or
@@ -428,11 +503,14 @@ def _log_summary(s: Settings) -> None:
         f"{s.polish.provider}{'+chat' if s.polish.use_polished_for_chat else ''}"
         if s.polish.enabled else "off"
     )
+    tts_tag = s.tts_active_model_id
+    if s.tts.provider == "dashscope" and s.dashscope.tts_is_realtime:
+        tts_tag += f" [WS mode={s.dashscope.tts_realtime_mode}]"
     logger.info(
         "config: ASR=%s(%s) LLM=%s(%s) TTS=%s(%s, voice=%s) polish=%s keep_audio=%s warmup=%s",
         s.asr.provider, s.asr_active_model_id,
         s.llm.provider, s.llm_active_model_id,
-        s.tts.provider, s.tts_active_model_id, s.tts.voice,
+        s.tts.provider, tts_tag, s.tts.voice,
         polish_tag, s.storage.keep_audio, s.warmup,
     )
 
@@ -472,6 +550,8 @@ def public_view() -> dict:
             "chat_model": s.dashscope.chat_model,
             "asr_model": s.dashscope.asr_model,
             "tts_model": s.dashscope.tts_model,
+            "tts_is_realtime": s.dashscope.tts_is_realtime,
+            "tts_realtime_mode": s.dashscope.tts_realtime_mode,
             "polish_model": s.dashscope.polish_model,
         },
         "ablework": {
@@ -489,6 +569,10 @@ def public_view() -> dict:
             "temperature": s.tts.temperature,
             "seed": s.tts.seed,
             "instruct": s.tts.instruct[:60] + ("…" if len(s.tts.instruct) > 60 else ""),
+            "speech_rate": s.tts.speech_rate,
+            "pitch_rate": s.tts.pitch_rate,
+            "volume": s.tts.volume,
+            "response_format": s.tts.response_format,
         },
         "polish": {
             "enabled": s.polish.enabled,

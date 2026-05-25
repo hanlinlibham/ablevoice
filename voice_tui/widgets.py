@@ -48,6 +48,7 @@ class StatusBar(Static):
     llm_info = reactive("")
     tts_info = reactive("")                # voice (provider)
     polish_enabled = reactive(True)        # toggleable via 'p' hotkey
+    workspace_name = reactive("")          # current ablework workspace or "" for default
     last_first_audio_ms = reactive(0)
     last_total_ms = reactive(0)
 
@@ -92,6 +93,10 @@ class StatusBar(Static):
         # polish on/off chip
         if not self.polish_enabled:
             t.append("  polish:off", style="dim red")
+        # workspace chip — empty = default sandbox
+        if self.workspace_name:
+            t.append("  WS:", style="dim")
+            t.append(self.workspace_name, style="bold yellow")
         # latency
         if self.last_first_audio_ms:
             t.append("  ★首音 ", style="dim")

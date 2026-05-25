@@ -77,7 +77,8 @@ class MlxLlm:
         return settings.llm.mlx_model
 
     async def stream(
-        self, messages: list[dict], session_id: str
+        self, messages: list[dict], session_id: str,
+        *, workspace_id: str | None = None,   # noqa: ARG002 — mlx has no workspace concept
     ) -> AsyncIterator[str]:
         from mlx_lm import stream_generate  # noqa: PLC0415 — heavy
 
@@ -125,7 +126,8 @@ class DashscopeLlm:
         return settings.dashscope.chat_model
 
     async def stream(
-        self, messages: list[dict], session_id: str
+        self, messages: list[dict], session_id: str,
+        *, workspace_id: str | None = None,   # noqa: ARG002 — dashscope chat is workspace-agnostic
     ) -> AsyncIterator[str]:
         if not settings.dashscope.api_key:
             raise RuntimeError(
@@ -187,7 +189,8 @@ class AbleworkLlm:
         return "ablework"
 
     async def stream(
-        self, messages: list[dict], session_id: str
+        self, messages: list[dict], session_id: str,
+        *, workspace_id: str | None = None,
     ) -> AsyncIterator[str]:
         if not settings.ablework.token:
             raise RuntimeError(
@@ -198,12 +201,18 @@ class AbleworkLlm:
         # system prompt and only wants user/assistant alternation.
         clean_msgs = [m for m in messages if m.get("role") in ("user", "assistant")]
         conv_id = _ablework_conv_ids.setdefault(session_id, uuid.uuid4().hex)
-        body = {
+        body: dict = {
             "messages": clean_msgs,
             "id": conv_id,
             "preset_id": None,
             "controller_mode": "on",
         }
+        # workspace_id: per-session override > env default > none. When
+        # set, ablework mounts that workspace's folder manifest into the
+        # sandbox (ADR-006 phase 3a-2 in ablework backend).
+        effective_ws = workspace_id or settings.ablework.default_workspace_id
+        if effective_ws:
+            body["workspace_id"] = effective_ws
         headers = {
             "Authorization": f"Bearer {settings.ablework.token}",
             "Content-Type": "application/json",
@@ -253,7 +262,8 @@ class OllamaLlm:
         return settings.ollama.model
 
     async def stream(
-        self, messages: list[dict], session_id: str
+        self, messages: list[dict], session_id: str,
+        *, workspace_id: str | None = None,   # noqa: ARG002 — ollama has no workspace
     ) -> AsyncIterator[str]:
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream(

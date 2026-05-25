@@ -9,13 +9,19 @@ re-encodes through the same path.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import io
+import json
 import logging
+import ssl
 import time
+import uuid
 import wave
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import httpx
+import websockets as _wspkg
 
 from ..audio import pcm_float_to_wav_bytes
 from ..config import settings
@@ -156,6 +162,10 @@ class MlxTts:
     async def synth(self, text: str, *, voice: str | None = None) -> tuple[bytes, int, int]:
         return await mlx_call(_synth_mlx_sync, text, voice)
 
+    def stream(self, *, voice: str | None = None):  # noqa: ARG002
+        # MLX path is one-shot; chat.py falls back to synth() per sentence.
+        return None
+
 
 # --- DashScope cloud --------------------------------------------------------
 
@@ -233,3 +243,261 @@ class DashscopeTts:
         # is also serving) stays serialised — and so the asyncio loop
         # isn't blocked by the sync httpx call.
         return await mlx_call(_synth_dashscope_sync, text, voice)
+
+    def stream(self, *, voice: str | None = None):  # noqa: ARG002
+        # HTTP one-shot endpoint — no duplex, callers fall back to synth().
+        return None
+
+
+# --- DashScope Realtime WS --------------------------------------------------
+# Spec: wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=<id>
+# Auth header `Authorization: Bearer <api_key>`. Client events: session.update,
+# input_text_buffer.append/commit/clear, session.finish. Server events:
+# session.created/updated/finished, response.created, response.output_item.added,
+# response.audio.delta (base64 PCM in `delta`), response.audio.done,
+# response.done, error.
+
+class DashscopeRealtimeTtsStream:
+    """One duplex Qwen-TTS Realtime session. Each chat turn opens, streams
+    LLM tokens via ``append``, drains audio via ``audio_frames``, then
+    ``finish`` (graceful) or ``cancel`` (abrupt — for user interrupts).
+
+    Concurrency:
+      - ``_reader_loop`` task consumes upstream JSON events, pushes raw
+        int16 PCM to ``_audio_q``.
+      - ``audio_frames`` is the async generator the caller iterates.
+      - ``_opened`` event gates ``open()`` returning until the server
+        confirms ``session.updated`` (catches bad-creds / bad-voice fast).
+      - ``_finished`` event lets ``finish()`` wait for ``session.finished``
+        before closing, so we don't truncate trailing audio.
+    """
+
+    def __init__(self, voice: Optional[str] = None):
+        self._voice = voice
+        self._ws: Optional[_wspkg.WebSocketClientProtocol] = None
+        self._reader_task: Optional[asyncio.Task] = None
+        self._opened = asyncio.Event()
+        self._finished = asyncio.Event()
+        self._open_error: Optional[str] = None
+        self._audio_q: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+        self._sample_rate = settings.tts.sr
+
+    @property
+    def sample_rate(self) -> int:
+        return self._sample_rate
+
+    async def open(self) -> None:
+        ds = settings.dashscope
+        t = settings.tts
+        if not ds.api_key:
+            raise RuntimeError(
+                "DASHSCOPE_API_KEY empty — set it in .env.local before using "
+                "the realtime TTS WS path."
+            )
+        url = f"{ds.tts_realtime_url}?model={ds.tts_model}"
+        headers = {"Authorization": f"Bearer {ds.api_key}"}
+        # ``verify=False`` parity with the HTTP path: corp proxy MITMs.
+        ssl_ctx = ssl._create_unverified_context() if url.startswith("wss://") else None
+        try:
+            self._ws = await _wspkg.connect(
+                url,
+                additional_headers=headers,
+                ssl=ssl_ctx,
+                max_size=None,
+                ping_interval=20,
+                open_timeout=10,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"realtime TTS WS connect failed: {exc}") from exc
+
+        self._reader_task = asyncio.create_task(
+            self._reader_loop(), name="dashscope-rt-tts-reader",
+        )
+
+        # ``session.update`` — declare voice / mode / audio format /
+        # rate-pitch-volume up-front. Only attach ``instructions`` when
+        # the selected model variant supports it (qwen3-tts-instruct-*).
+        session_cfg: dict = {
+            "voice": self._voice or t.voice,
+            "mode": ds.tts_realtime_mode,
+            "language_type": ds.tts_lang,
+            "response_format": t.response_format,
+            "sample_rate": t.sr,
+            "speech_rate": t.speech_rate,
+            "pitch_rate": t.pitch_rate,
+            "volume": t.volume,
+        }
+        if t.response_format == "opus":
+            session_cfg["bit_rate"] = t.bit_rate
+        if t.instruct and "instruct" in ds.tts_model:
+            session_cfg["instructions"] = t.instruct
+            session_cfg["optimize_instructions"] = True
+        await self._send({"type": "session.update", "session": session_cfg})
+
+        try:
+            await asyncio.wait_for(self._opened.wait(), timeout=10)
+        except asyncio.TimeoutError as exc:
+            await self.cancel()
+            raise RuntimeError("realtime TTS session.update timed out") from exc
+        if self._open_error:
+            err = self._open_error
+            await self.cancel()
+            raise RuntimeError(f"realtime TTS session.update rejected: {err}")
+
+    async def append(self, text_delta: str) -> None:
+        if not text_delta or self._ws is None or self._finished.is_set():
+            return
+        await self._send({"type": "input_text_buffer.append", "text": text_delta})
+
+    async def finish(self) -> None:
+        """Send session.finish, wait for session.finished + drain audio,
+        then close. Bounded by timeout so a stuck upstream can't hang
+        chat teardown."""
+        if self._ws is None:
+            return
+        try:
+            await self._send({"type": "session.finish"})
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(self._finished.wait(), timeout=20)
+        except asyncio.TimeoutError:
+            logger.warning("realtime TTS session.finish timeout")
+        await self._close()
+
+    async def cancel(self) -> None:
+        """Abrupt close — for user interruption mid-chat. We don't bother
+        with session.finish; just shut the socket so the upstream stops
+        billing and our reader unwinds."""
+        await self._close()
+
+    async def _send(self, payload: dict) -> None:
+        if self._ws is None:
+            return
+        payload = {"event_id": uuid.uuid4().hex, **payload}
+        await self._ws.send(json.dumps(payload))
+
+    async def _reader_loop(self) -> None:
+        assert self._ws is not None
+        try:
+            async for msg in self._ws:
+                if isinstance(msg, (bytes, bytearray)):
+                    # Spec uses JSON only; defensively ignore binary.
+                    continue
+                try:
+                    ev = json.loads(msg)
+                except json.JSONDecodeError:
+                    logger.warning("realtime TTS bad JSON from server: %.120s", msg)
+                    continue
+                t = ev.get("type")
+                if t == "session.updated":
+                    self._opened.set()
+                elif t == "response.audio.delta":
+                    b64 = ev.get("delta") or ""
+                    if b64:
+                        try:
+                            pcm = base64.b64decode(b64)
+                        except Exception:  # noqa: BLE001
+                            logger.exception("realtime TTS bad base64 delta")
+                            continue
+                        if pcm:
+                            await self._audio_q.put(pcm)
+                elif t == "session.finished":
+                    break
+                elif t == "error":
+                    err = ev.get("error") or {}
+                    msg_txt = err.get("message") or str(err)
+                    logger.warning("realtime TTS server error: %s", msg_txt)
+                    if not self._opened.is_set():
+                        self._open_error = msg_txt
+                    break
+                # Unhandled (session.created / response.created / response.done /
+                # response.audio.done / input_text_buffer.committed) — informational.
+        except _wspkg.exceptions.ConnectionClosed:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.exception("realtime TTS reader crashed")
+        finally:
+            self._opened.set()
+            self._finished.set()
+            await self._audio_q.put(None)
+
+    async def audio_frames(self) -> AsyncIterator[bytes]:
+        while True:
+            chunk = await self._audio_q.get()
+            if chunk is None:
+                return
+            yield chunk
+
+    async def _close(self) -> None:
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        if self._reader_task is not None and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except Exception:
+                pass
+        self._opened.set()
+        self._finished.set()
+
+
+class DashscopeRealtimeTts:
+    """Realtime WS TTS provider. ``stream()`` is the fast path used by
+    chat.py; ``synth()`` (for one-shot /tts and synth_one) runs the same
+    WS round-trip but buffers the full PCM into a single WAV blob to
+    match the legacy interface."""
+
+    @property
+    def model_id(self) -> str:
+        return settings.dashscope.tts_model
+
+    def stream(self, *, voice: str | None = None) -> DashscopeRealtimeTtsStream:
+        return DashscopeRealtimeTtsStream(voice=voice)
+
+    async def synth(self, text: str, *, voice: str | None = None) -> tuple[bytes, int, int]:
+        import numpy as np  # noqa: PLC0415
+
+        sess = self.stream(voice=voice)
+        await sess.open()
+        try:
+            await sess.append(text)
+            # Drain audio frames concurrently with finish() so we don't
+            # deadlock — finish() waits for session.finished, which only
+            # fires after the server emits all audio.
+            collected: list[bytes] = []
+
+            async def _collect() -> None:
+                async for chunk in sess.audio_frames():
+                    collected.append(chunk)
+
+            collector = asyncio.create_task(_collect(), name="rt-tts-one-shot-collect")
+            try:
+                await sess.finish()
+            finally:
+                try:
+                    await asyncio.wait_for(collector, timeout=5)
+                except asyncio.TimeoutError:
+                    collector.cancel()
+                    try:
+                        await collector
+                    except (asyncio.CancelledError, Exception):
+                        pass
+        finally:
+            await sess.cancel()  # idempotent if finish() already closed
+
+        if not collected:
+            return b"", sess.sample_rate, 0
+        pcm = b"".join(collected)
+        # int16 LE → float32 [-1, 1] → re-encode through the shared
+        # post-processor for trim + RMS-normalise parity with HTTP path.
+        arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        wav = pcm_float_to_wav_bytes(arr, sess.sample_rate)
+        with wave.open(io.BytesIO(wav), "rb") as wf:
+            n = wf.getnframes()
+            sr = wf.getframerate()
+        return wav, sr, n
