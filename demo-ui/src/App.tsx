@@ -7,10 +7,7 @@ import {
   Trash2,
   Volume2,
   Send,
-  Bot,
   RefreshCw,
-  Plug,
-  PlugZap,
   StopCircle,
 } from "lucide-react";
 
@@ -25,45 +22,163 @@ import {
 
 type Role = "user" | "assistant" | "system";
 
-function Message({ role, children, footer }: {
+function Message({ role, children, footer, polishChanged }: {
   role: Role;
   children: React.ReactNode;
   footer?: React.ReactNode;
+  /** When the user bubble has a polished+raw diff, switch border to
+   *  magenta so the eye lands on the bubble with the diff. */
+  polishChanged?: boolean;
 }) {
-  const alignment = role === "user" ? "items-end" : "items-start";
-  const bubble =
+  // Side-aligned bubbles like a chat client: user right, AI left, system center.
+  const alignment = role === "user" ? "items-end" : role === "assistant" ? "items-start" : "items-stretch";
+  const label = role === "user" ? "你" : role === "assistant" ? "AI" : "";
+  const borderColor =
     role === "user"
-      ? "bg-(--color-accent-soft) border-(--color-accent)/40 text-(--color-text)"
+      ? polishChanged
+        ? "border-fuchsia-500/60"
+        : "border-cyan-500/40"
       : role === "assistant"
-      ? "bg-(--color-bg) border-(--color-accent)/30 text-(--color-text)"
-      : "bg-(--color-panel) border-(--color-border) text-(--color-muted)";
-  return (
-    <div className={`flex flex-col gap-1 ${alignment}`}>
-      <div className={`max-w-[88%] rounded-2xl border px-4 py-3 leading-relaxed ${bubble}`}>
-        {children}
+      ? "border-emerald-500/40"
+      : "border-(--color-border)";
+  const labelColor =
+    role === "user" ? "text-cyan-400" : role === "assistant" ? "text-emerald-400" : "text-(--color-muted)";
+  const bubbleBg =
+    role === "user"
+      ? "bg-cyan-500/5"
+      : role === "assistant"
+      ? "bg-emerald-500/5"
+      : "bg-transparent";
+  // System messages render as dim italic single line — matches TUI's
+  // "  · message" rendering.
+  if (role === "system") {
+    return (
+      <div className="text-xs text-(--color-muted) italic flex items-start gap-1 px-1">
+        <span className="opacity-50 mt-px">·</span>
+        <span className="flex-1 whitespace-pre-wrap break-words">{children}</span>
       </div>
-      {footer && (
-        <div className="text-xs text-(--color-muted)">{footer}</div>
-      )}
+    );
+  }
+  return (
+    <div className={`flex flex-col gap-0.5 ${alignment}`}>
+      <div className={`max-w-[88%] rounded-lg border ${borderColor} ${bubbleBg}`}>
+        {/* Title bar — matches TUI Panel's title_align="left" header */}
+        <div className="px-3 pt-1.5 pb-1 flex items-baseline justify-between gap-2 border-b border-current/10">
+          <span className={`text-xs font-semibold ${labelColor}`}>{label}</span>
+          {footer && <div className="text-[10px] text-(--color-muted)">{footer}</div>}
+        </div>
+        <div className="px-3 py-2 leading-relaxed text-sm">{children}</div>
+      </div>
     </div>
   );
 }
 
-function StatusPill({ kind, children }: {
-  kind: "idle" | "recording" | "transcribing" | "error" | "disconnected";
-  children: React.ReactNode;
+// Braille spinner — same frames as TUI's _SPINNER_FRAMES so the two
+// clients feel consistent. 8 fps tick = changes ~125ms.
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+function useSpinner(active: boolean): string {
+  const [frame, setFrame] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const t = setInterval(() => setFrame((f) => (f + 1) % SPINNER_FRAMES.length), 125);
+    return () => clearInterval(t);
+  }, [active]);
+  return SPINNER_FRAMES[frame];
+}
+
+/** Single dense status chip — mode label + spinner + colored bg.
+ *  Replaces the old 4-pill conditional. Mode priority (top→bottom):
+ *  reconnecting > recording > finalizing > polishing > chatting > idle. */
+function ModeChip({
+  connected, recording, polishing, chatting, playing,
+}: {
+  connected: boolean; recording: boolean; polishing: boolean;
+  chatting: boolean; playing: boolean;
 }) {
-  const styles: Record<typeof kind, string> = {
-    idle:         "border-(--color-border) text-(--color-muted)",
-    recording:    "border-(--color-warn) text-(--color-warn) bg-(--color-warn)/10 animate-pulse",
-    transcribing: "border-(--color-accent) text-(--color-accent) bg-(--color-accent)/10",
-    error:        "border-(--color-error) text-(--color-error) bg-(--color-error)/10",
-    disconnected: "border-(--color-error)/50 text-(--color-error) bg-(--color-error)/5",
-  } as const;
+  const active = recording || polishing || chatting || !connected;
+  const spin = useSpinner(active);
+  let label: string;
+  let cls: string;
+  if (!connected) { label = "● 未连接"; cls = "bg-rose-500/15 text-rose-400 border-rose-500/40"; }
+  else if (recording) { label = `${spin} 录音中`; cls = "bg-amber-500/15 text-amber-400 border-amber-500/40"; }
+  else if (polishing) { label = `${spin} 整理中`; cls = "bg-fuchsia-500/15 text-fuchsia-400 border-fuchsia-500/40"; }
+  else if (chatting)  { label = playing ? `${spin} 播放中` : `${spin} 思考/合成中`;
+                         cls = "bg-emerald-500/15 text-emerald-400 border-emerald-500/40"; }
+  else                { label = "✓ 就绪"; cls = "bg-cyan-500/15 text-cyan-400 border-cyan-500/40"; }
   return (
-    <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${styles[kind]}`}>
-      {children}
+    <span className={`inline-flex items-center rounded border px-2 py-0.5 text-xs font-mono font-semibold ${cls}`}>
+      {label}
     </span>
+  );
+}
+
+/** Live mic meter — matches TUI MicMeter widget. Shows ``mm:ss``
+ *  recording duration (yellow) + colored level bar + numeric level.
+ *  Only renders when actively recording. */
+function RecordingMeter({ level, peak, startedAt }: {
+  level: number; peak: number; startedAt: number | null;
+}) {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!startedAt) return;
+    const t = setInterval(() => setTick((n) => n + 1), 250);
+    return () => clearInterval(t);
+  }, [startedAt]);
+  // tick is unused by purpose — its re-render is what updates the
+  // displayed mm:ss. Reference it so eslint doesn't flag unused.
+  void tick;
+  const dur = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
+  const mm = String(Math.floor(dur / 60)).padStart(2, "0");
+  const ss = String(dur % 60).padStart(2, "0");
+  const width = Math.min(100, level * 300);
+  const color =
+    level < 0.02 ? "bg-rose-500" :
+    level < 0.08 ? "bg-amber-500" :
+                   "bg-emerald-500";
+  return (
+    <div className="flex items-center gap-3 font-mono text-xs px-4 py-1.5 bg-amber-500/5 border-y border-amber-500/20">
+      <span className="text-amber-400 font-bold tabular-nums">{mm}:{ss}</span>
+      <span className="text-(--color-muted)">mic</span>
+      <div className="relative flex-1 h-2 rounded overflow-hidden bg-(--color-bg) border border-(--color-border)">
+        <div className={`h-full transition-[width] duration-75 ${color}`} style={{ width: `${width}%` }} />
+      </div>
+      <span className="text-(--color-muted) tabular-nums">{(level * 100).toFixed(1)}%</span>
+      <span className="text-(--color-muted) tabular-nums">peak {(peak * 100).toFixed(0)}%</span>
+      {level < 0.02 && <span className="text-rose-400">← 没采到声音</span>}
+    </div>
+  );
+}
+
+/** Bottom hotkey hints — matches TUI Footer. Mouse-clickable too. */
+function HotkeyHints({ onSpace, onInterrupt, onReset, onToggleWsList, onTogglePolish, onQuit }: {
+  onSpace: () => void; onInterrupt: () => void; onReset: () => void;
+  onToggleWsList: () => void; onTogglePolish: () => void; onQuit?: () => void;
+}) {
+  const items: Array<[string, string, () => void]> = [
+    ["Space", "录音", onSpace],
+    ["i",     "打断", onInterrupt],
+    ["r",     "重置", onReset],
+    ["w",     "工作区", onToggleWsList],
+    ["p",     "polish", onTogglePolish],
+    ["⌘⇧Space", "全局录音", () => {}],   // not clickable; just info
+  ];
+  if (onQuit) items.push(["q", "退出", onQuit]);
+  return (
+    <div className="border-t border-(--color-border) bg-(--color-panel) px-4 py-1 flex items-center gap-3 text-[11px] font-mono text-(--color-muted) overflow-x-auto">
+      {items.map(([k, label, fn]) => (
+        <button
+          key={k}
+          type="button"
+          onClick={fn}
+          className="flex items-center gap-1 hover:text-(--color-accent) transition"
+          title={`${k} → ${label}`}
+        >
+          <kbd className="px-1 rounded border border-(--color-border)/50 bg-(--color-bg) text-(--color-text)/80">{k}</kbd>
+          <span>{label}</span>
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -502,6 +617,10 @@ export default function App() {
   const [lastAction, setLastAction] = useState<{ text: string; until: number } | null>(null);
   // ── reconnect / retry banner (auto-fade after 4s) ──
   const [retryBanner, setRetryBanner] = useState<{ text: string; until: number } | null>(null);
+  // ── recording started timestamp (for mm:ss timer in RecordingMeter)
+  // effect that depends on ws.recording lives *after* the useVoiceWS
+  // call below so ``ws`` is in scope.
+  const [recordingStartedAt, setRecordingStartedAt] = useState<number | null>(null);
   const audioQueue = useAudioQueue();
 
   // Per-tab session id; refresh = brand-new conversation.
@@ -759,6 +878,12 @@ export default function App() {
     return () => clearInterval(t);
   }, [lastAction, retryBanner]);
 
+  // Recording timer trigger — set timestamp on transition into recording,
+  // clear on transition out. Mounted here because ws is in scope.
+  useEffect(() => {
+    setRecordingStartedAt(ws.recording ? Date.now() : null);
+  }, [ws.recording]);
+
   // Cold-load: hydrate the conversation panel from SQLite (read-only —
   // server-side LLM history is per-session, but ASR transcripts persist).
   useEffect(() => {
@@ -891,74 +1016,69 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col">
-      {/* Header */}
-      <header className="border-b border-(--color-border) bg-(--color-panel) px-6 py-3">
-        <div className="mx-auto flex max-w-3xl items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Sparkles size={18} className="text-(--color-accent)" />
-            <span className="font-medium">voice-asr-test</span>
-            <span
-              className="text-xs text-(--color-muted) font-mono"
-              title={
-                serverInfo
-                  ? `ASR: ${serverInfo.asr_model_id}\nLLM: ${serverInfo.llm_model_id}\nTTS: ${serverInfo.tts_model_id}`
-                  : ""
-              }
-            >
-              {serverInfo
-                ? `${serverInfo.asr_model_id.split("/").pop()} · ${serverInfo.llm_model_id} · ${serverInfo.tts_model_id.split("/").pop()?.replace("Qwen3-TTS-12Hz-", "TTS-")}`
-                : "loading…"}
-            </span>
+      {/* Header — dense single-row status bar, TUI vibe.
+          Brand · Mode chip · Provider info · Latency · Actions */}
+      <header className="border-b border-(--color-border) bg-(--color-panel) px-4 py-1.5">
+        <div className="flex items-center gap-3 font-mono text-xs">
+          {/* Brand */}
+          <div className="flex items-center gap-1.5 text-(--color-text)">
+            <Sparkles size={14} className="text-(--color-accent)" />
+            <span className="font-semibold">able-asr</span>
           </div>
-          <div className="flex items-center gap-3">
-            {!ws.connected && (
-              <StatusPill kind="disconnected">
-                <Plug size={12} />
-                WS 未连接
-              </StatusPill>
-            )}
-            {ws.connected && !ws.recording && !chatting && (
-              <StatusPill kind="idle">
-                <PlugZap size={12} />
-                就绪
-              </StatusPill>
-            )}
-            {ws.recording && (
-              <StatusPill kind="recording">
-                <span className="inline-block size-2 rounded-full bg-(--color-warn)" />
-                录音中
-              </StatusPill>
-            )}
-            {chatting && (
-              <StatusPill kind="transcribing">
-                <Bot size={12} className="animate-pulse" />
-                {audioQueue.playing ? "AI 回复中(播放)" : "AI 思考/合成中"}
-              </StatusPill>
-            )}
-            {latestTranscribeMs !== null && (
-              <span className="text-xs text-(--color-muted)">last ASR {latestTranscribeMs}ms</span>
-            )}
-            {chatting && (
-              <button
-                type="button"
-                onClick={() => { ws.interrupt(); audioQueue.stop(); }}
-                className="inline-flex items-center gap-1 rounded-full border border-(--color-warn)/60 px-2.5 py-1 text-xs text-(--color-warn) hover:bg-(--color-warn)/10 transition"
-                title="打断当前 AI 回复(server 端 cancel + 本地清队列)"
-              >
-                <StopCircle size={12} />
-                打断
-              </button>
-            )}
+          {/* Mode chip */}
+          <ModeChip
+            connected={ws.connected}
+            recording={ws.recording}
+            polishing={polishing}
+            chatting={chatting}
+            playing={audioQueue.playing}
+          />
+          {/* Provider info — dense, TUI-style "ASR ... · LLM ... · TTS ..." */}
+          {serverInfo && (
+            <div className="flex items-center gap-3 text-(--color-muted) overflow-hidden">
+              <span className="whitespace-nowrap">
+                <span className="opacity-60">ASR </span>
+                <span className="text-cyan-400">{serverInfo.asr_model_id.split("/").pop()}</span>
+              </span>
+              <span className="text-(--color-border)">·</span>
+              <span className="whitespace-nowrap">
+                <span className="opacity-60">LLM </span>
+                <span className="text-cyan-400">{serverInfo.llm_model_id}</span>
+              </span>
+              <span className="text-(--color-border)">·</span>
+              <span className="whitespace-nowrap">
+                <span className="opacity-60">TTS </span>
+                <span className="text-cyan-400">{serverInfo.tts_model_id.split("/").pop()?.replace("Qwen3-TTS-12Hz-", "")}</span>
+              </span>
+            </div>
+          )}
+          {/* Latency stats — right-aligned via flex-1 spacer */}
+          <div className="flex-1" />
+          {latestTranscribeMs !== null && (
+            <span className="text-(--color-muted) whitespace-nowrap">
+              <span className="opacity-60">★ASR </span>
+              <span className="text-emerald-400">{latestTranscribeMs}ms</span>
+            </span>
+          )}
+          {/* Actions */}
+          {chatting && (
             <button
               type="button"
-              onClick={resetConversation}
-              className="inline-flex items-center gap-1 rounded-full border border-(--color-border) px-2.5 py-1 text-xs text-(--color-muted) hover:border-(--color-accent) hover:text-(--color-accent) transition"
-              title="清空对话上下文(server + client)"
+              onClick={() => { ws.interrupt(); audioQueue.stop(); }}
+              className="inline-flex items-center gap-1 rounded border border-amber-500/60 px-2 py-0.5 text-amber-400 hover:bg-amber-500/10 transition"
+              title="打断 AI 回复"
             >
-              <RefreshCw size={12} />
-              重置
+              <StopCircle size={11} />打断
             </button>
-          </div>
+          )}
+          <button
+            type="button"
+            onClick={resetConversation}
+            className="inline-flex items-center gap-1 rounded border border-(--color-border) px-2 py-0.5 text-(--color-muted) hover:border-(--color-accent) hover:text-(--color-accent) transition"
+            title="清空对话"
+          >
+            <RefreshCw size={11} />重置
+          </button>
         </div>
       </header>
 
@@ -1122,7 +1242,7 @@ export default function App() {
                 e.text
               );
             return (
-              <Message key={e.id} role={e.kind} footer={footer}>
+              <Message key={e.id} role={e.kind} footer={footer} polishChanged={!!showPolishDiff}>
                 {content}
               </Message>
             );
@@ -1136,88 +1256,72 @@ export default function App() {
         </div>
       </section>
 
-      {/* Composer */}
-      <footer className="border-t border-(--color-border) bg-(--color-panel) px-6 py-4">
-        <div className="mx-auto flex max-w-3xl flex-col items-center gap-3">
-          <form
-            className="flex w-full items-center gap-2"
-            onSubmit={(e) => { e.preventDefault(); submitComposerTts(); }}
-          >
-            <input
-              type="text"
-              value={ttsText}
-              onChange={(ev) => setTtsText(ev.target.value)}
-              placeholder='试合成:比如 "你好,这是 Qwen3-TTS 的测试"'
-              className="flex-1 rounded-lg border border-(--color-border) bg-(--color-bg) px-3 py-2 text-sm placeholder:text-(--color-muted)/60 focus:outline-none focus:border-(--color-accent)"
-            />
-            <button
-              type="submit"
-              disabled={!ttsText.trim() || composerBusy || !ws.connected}
-              className="inline-flex items-center gap-1 rounded-lg border border-(--color-border) bg-(--color-bg) px-3 py-2 text-sm transition hover:border-(--color-accent) hover:text-(--color-accent) disabled:opacity-40 disabled:cursor-not-allowed"
-              title="合成并播放(回车也行)"
-            >
-              {composerBusy ? (
-                <Loader2 size={14} className="animate-spin" />
-              ) : (
-                <Send size={14} />
-              )}
-              合成
-            </button>
-          </form>
-          <button
-            type="button"
-            onMouseDown={onPressStart}
-            onMouseUp={onPressEnd}
-            onMouseLeave={() => { if (ws.recording) onPressEnd(); }}
-            onTouchStart={(e) => { e.preventDefault(); onPressStart(); }}
-            onTouchEnd={(e) => { e.preventDefault(); onPressEnd(); }}
-            onKeyDown={onKeyDown}
-            onKeyUp={onKeyUp}
-            disabled={!ws.connected}
-            className={`group flex size-20 items-center justify-center rounded-full border transition
-              ${ws.recording
-                ? "border-(--color-warn) bg-(--color-warn)/20 scale-110"
-                : !ws.connected
-                ? "border-(--color-border)/50 bg-(--color-bg) opacity-50 cursor-not-allowed"
-                : "border-(--color-border) bg-(--color-bg) hover:bg-(--color-panel) hover:border-(--color-accent)"
-              }`}
-            aria-label="按住录音"
-          >
-            {ws.recording ? (
-              <Square size={24} className="fill-(--color-warn) text-(--color-warn)" />
-            ) : (
-              <Mic size={28} className="text-(--color-text) group-hover:text-(--color-accent)" />
-            )}
-          </button>
-          {ws.recording && (
-            <div className="flex w-full max-w-md flex-col items-center gap-1">
-              <div className="relative h-2 w-full overflow-hidden rounded-full bg-(--color-bg) border border-(--color-border)">
-                <div
-                  className="h-full transition-[width] duration-75"
-                  style={{
-                    width: `${Math.min(100, ws.level * 300)}%`,
-                    background:
-                      ws.level < 0.02
-                        ? "var(--color-error)"
-                        : ws.level < 0.08
-                        ? "var(--color-warn)"
-                        : "var(--color-success)",
-                  }}
-                />
-              </div>
-              <span className="text-xs text-(--color-muted)">
-                mic level: {(ws.level * 100).toFixed(1)}% · peak {(ws.peak * 100).toFixed(0)}%
-                {ws.level < 0.02 && " — 没采到声音,检查 mic 选择"}
-              </span>
-            </div>
+      {/* Recording meter — own row, only when recording. mm:ss + bar. */}
+      {ws.recording && (
+        <RecordingMeter level={ws.level} peak={ws.peak} startedAt={recordingStartedAt} />
+      )}
+
+      {/* Composer — TTS try-out + central record button */}
+      <div className="border-t border-(--color-border) bg-(--color-panel) px-4 py-2 flex items-center gap-3">
+        {/* Record button — compact, left-aligned */}
+        <button
+          type="button"
+          onMouseDown={onPressStart}
+          onMouseUp={onPressEnd}
+          onMouseLeave={() => { if (ws.recording) onPressEnd(); }}
+          onTouchStart={(e) => { e.preventDefault(); onPressStart(); }}
+          onTouchEnd={(e) => { e.preventDefault(); onPressEnd(); }}
+          onKeyDown={onKeyDown}
+          onKeyUp={onKeyUp}
+          disabled={!ws.connected}
+          className={`flex size-10 items-center justify-center rounded-full border-2 transition shrink-0
+            ${ws.recording
+              ? "border-amber-500 bg-amber-500/30 animate-pulse"
+              : !ws.connected
+              ? "border-(--color-border)/50 bg-(--color-bg) opacity-50 cursor-not-allowed"
+              : "border-(--color-border) bg-(--color-bg) hover:border-amber-500 hover:text-amber-500"
+            }`}
+          aria-label="按住录音"
+          title="按住录音 / Space / ⌘⇧Space"
+        >
+          {ws.recording ? (
+            <Square size={14} className="fill-amber-500 text-amber-500" />
+          ) : (
+            <Mic size={16} className="text-(--color-text)" />
           )}
-          <p className="text-center text-xs text-(--color-muted)">
-            按住按钮(或 Space 键)说话 · AudioWorklet 16kHz PCM → WebSocket 实时上传
-            <br />
-            AI 回复时再按一次录音键 = 自动打断 · 首次 TTS 会下载模型 ~2-3GB
-          </p>
-        </div>
-      </footer>
+        </button>
+        {/* Compose TTS — quick voice test */}
+        <form
+          className="flex flex-1 items-center gap-2"
+          onSubmit={(e) => { e.preventDefault(); submitComposerTts(); }}
+        >
+          <input
+            type="text"
+            value={ttsText}
+            onChange={(ev) => setTtsText(ev.target.value)}
+            placeholder='试合成 TTS · 或按住录音按钮说话'
+            className="flex-1 rounded border border-(--color-border) bg-(--color-bg) px-3 py-1.5 text-sm placeholder:text-(--color-muted)/60 focus:outline-none focus:border-(--color-accent)"
+          />
+          <button
+            type="submit"
+            disabled={!ttsText.trim() || composerBusy || !ws.connected}
+            className="inline-flex items-center gap-1 rounded border border-(--color-border) bg-(--color-bg) px-2.5 py-1.5 text-sm transition hover:border-(--color-accent) hover:text-(--color-accent) disabled:opacity-40 disabled:cursor-not-allowed"
+            title="合成并播放"
+          >
+            {composerBusy ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
+            合成
+          </button>
+        </form>
+      </div>
+
+      {/* Hotkey hints — bottom strip, TUI Footer parity */}
+      <HotkeyHints
+        onSpace={() => ws.recording ? onPressEnd() : onPressStart()}
+        onInterrupt={() => { ws.interrupt(); audioQueue.stop(); }}
+        onReset={resetConversation}
+        onToggleWsList={() => setWsListOpen((v) => !v)}
+        onTogglePolish={() => ws.send({ type: "set_polish", enabled: false })}
+      />
     </div>
   );
 }
