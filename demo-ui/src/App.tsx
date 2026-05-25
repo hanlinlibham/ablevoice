@@ -3,7 +3,6 @@ import {
   Mic,
   Square,
   Loader2,
-  AlertTriangle,
   Sparkles,
   Trash2,
   Volume2,
@@ -86,6 +85,11 @@ type Entry = {
   streaming?: boolean;
   /** Assistant-only: how many audio chunks have been queued so far. */
   audioChunks?: number;
+  /** User-only: pre-polish text (only set when polish actually changed
+   *  the bubble). Rendered below ``text`` as struck-through dim. */
+  raw?: string;
+  /** User-only: polish latency in ms. */
+  polishMs?: number;
 };
 
 type HistoryRow = {
@@ -189,12 +193,26 @@ function useAudioQueue() {
  * mean threading refs around. The hook stays ~150 lines, which is fine.
  * ------------------------------------------------------------------------ */
 
+type Workspace = {
+  id: string;
+  name: string;
+  last_active_at?: string;
+};
+
 type WSHandlers = {
   onReady?: (info: { asr_model_id: string; tts_model_id: string; llm_model_id: string }) => void;
   onAsrPartial?: (t: { text: string; stable_text: string }) => void;
   onTranscript?: (t: {
     id: string; text: string; ms: number; audio_bytes: number; peak_level: number | null;
     created_at: string; model: string;
+  }) => void;
+  onTranscriptPolished?: (p: {
+    id: string; text: string; raw: string; skipped: boolean;
+    attempts: number; ok: boolean; errors: string[]; ms: number;
+  }) => void;
+  onPolish?: (p: {
+    raw: string; final: string; skipped: boolean; ok: boolean;
+    attempts: number; ms: number;
   }) => void;
   onMeta?: (m: { model: string; voice: string }) => void;
   onAssistantToken?: (delta: string) => void;
@@ -204,6 +222,23 @@ type WSHandlers = {
   onTtsDone?: (s: { ms: number; dur_ms: number; size: number }) => void;
   onHistoryReset?: (cleared: number) => void;
   onError?: (where: string, message: string) => void;
+  onRetry?: (r: {
+    where: string; attempt: number; max_attempts: number;
+    wait_ms: number; reason: string;
+  }) => void;
+  onWorkspaceList?: (l: {
+    workspaces: Workspace[]; current_id: string | null; current_name: string | null;
+  }) => void;
+  onWorkspaceChanged?: (c: {
+    id: string | null; name: string | null; intent: string;
+    ok: boolean; error: string | null;
+  }) => void;
+  onIntentAck?: (a: {
+    intent: string; text: string; workspace_id: string | null;
+    workspace_match: string | null; ms_classify: number; ms_handle: number;
+  }) => void;
+  onVoiceSet?: (v: { voice: string | null; provider: string | null }) => void;
+  onPolishSet?: (p: { enabled: boolean }) => void;
 };
 
 type VoiceWS = {
@@ -216,6 +251,9 @@ type VoiceWS = {
   interrupt: () => void;
   reset: () => void;
   ttsOneShot: (text: string) => void;
+  /** Send a raw JSON event to the server (e.g. set_workspace,
+   *  refresh_workspaces, set_polish, set_voice). */
+  send: (obj: Record<string, unknown>) => void;
 };
 
 function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
@@ -277,6 +315,14 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
         case "tts_done":      h.onTtsDone?.(msg); break;
         case "history_reset": h.onHistoryReset?.(msg.cleared ?? 0); break;
         case "error":         h.onError?.(msg.where || "?", msg.message || "?"); break;
+        case "transcript_polished": h.onTranscriptPolished?.(msg); break;
+        case "polish":        h.onPolish?.(msg); break;
+        case "retry":         h.onRetry?.(msg); break;
+        case "workspace_list": h.onWorkspaceList?.(msg); break;
+        case "workspace_changed": h.onWorkspaceChanged?.(msg); break;
+        case "intent_ack":    h.onIntentAck?.(msg); break;
+        case "voice_set":     h.onVoiceSet?.(msg); break;
+        case "polish_set":    h.onPolishSet?.(msg); break;
         default: console.warn("unknown ws event", msg);
       }
     };
@@ -415,7 +461,14 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
     }
   }, []);
 
-  return { connected, recording, level, peak, startRecording, stopRecording, interrupt, reset, ttsOneShot };
+  const send = useCallback((obj: Record<string, unknown>) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
+  }, []);
+
+  return { connected, recording, level, peak, startRecording, stopRecording, interrupt, reset, ttsOneShot, send };
 }
 
 export default function App() {
@@ -435,12 +488,20 @@ export default function App() {
   const [ttsText, setTtsText] = useState("");
   const [composerBusy, setComposerBusy] = useState(false);
   const [chatting, setChatting] = useState(false);
+  const [polishing, setPolishing] = useState(false);   // true between transcript and transcript_polished
   const [latestTranscribeMs, setLatestTranscribeMs] = useState<number | null>(null);
   const [serverInfo, setServerInfo] = useState<{
     asr_model_id: string;
     tts_model_id: string;
     llm_model_id: string;
   } | null>(null);
+  // ── workspace state (driven by server's workspace_list/changed events) ──
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [currentWs, setCurrentWs] = useState<{ id: string | null; name: string }>({ id: null, name: "" });
+  const [wsListOpen, setWsListOpen] = useState(false);
+  const [lastAction, setLastAction] = useState<{ text: string; until: number } | null>(null);
+  // ── reconnect / retry banner (auto-fade after 4s) ──
+  const [retryBanner, setRetryBanner] = useState<{ text: string; until: number } | null>(null);
   const audioQueue = useAudioQueue();
 
   // Per-tab session id; refresh = brand-new conversation.
@@ -498,6 +559,9 @@ export default function App() {
     },
     onTranscript: (t) => {
       setLatestTranscribeMs(t.ms);
+      // Server emits transcript_polished within ~15ms-1.5s of transcript;
+      // turn on polishing indicator that the polished event clears.
+      setPolishing(true);
       // Clear the partial pointer; we'll either finalize that bubble
       // or (if empty transcript) replace it with a system note.
       const partialId = partialUserIdRef.current;
@@ -627,7 +691,73 @@ export default function App() {
       }
       if (where === "tts") setComposerBusy(false);
     },
+    onTranscriptPolished: (p) => {
+      setPolishing(false);
+      if (p.skipped || p.text === p.raw) return;
+      // Replace the most recent user bubble's text with polished + keep raw for diff
+      setEntries((prev) => {
+        const idx = [...prev].reverse().findIndex((e) => e.kind === "user");
+        if (idx < 0) return prev;
+        const realIdx = prev.length - 1 - idx;
+        const target = prev[realIdx];
+        const updated = { ...target, text: p.text, raw: p.raw, polishMs: p.ms };
+        return prev.map((e, i) => (i === realIdx ? updated : e));
+      });
+    },
+    onPolish: (p) => {
+      // Server's chat pipeline emits "polish" when run_chat_pipeline does
+      // its own polish (HTTP /chat path). Just flash polishing flag so
+      // the UI shows it.
+      setPolishing(!p.skipped);
+    },
+    onRetry: (r) => {
+      const text = `⟳ ${r.where} 重试 ${r.attempt}/${r.max_attempts} (${r.wait_ms}ms 后)  ${r.reason}`;
+      setRetryBanner({ text, until: Date.now() + 6000 });
+      // also leave a system message so user has a record
+      append({ kind: "system", text });
+    },
+    onWorkspaceList: (l) => {
+      setWorkspaces(l.workspaces || []);
+      setCurrentWs({ id: l.current_id, name: l.current_name || "" });
+      append({ kind: "system",
+        text: `工作区已加载:${l.workspaces?.length ?? 0} 个${l.current_name ? `(当前 ${l.current_name})` : ""}` });
+    },
+    onWorkspaceChanged: (c) => {
+      setCurrentWs({ id: c.id, name: c.name || "" });
+      const verb = {
+        ws_switch: "已切换到",
+        ws_create: "已新建并切入",
+        ws_move:   "已搬到",
+        ws_leave:  "已退出",
+        set_workspace: "已切到",
+      }[c.intent] || "→";
+      const label = c.name ? `${verb} ${c.name}` : "已退出工作区";
+      setLastAction({ text: `✦ ${label}`, until: Date.now() + 4000 });
+      // Drop a clear divider entry in conversation log
+      append({ kind: "system", text: `── ${label} ──` });
+    },
+    onIntentAck: (a) => {
+      const ms = a.ms_classify + a.ms_handle;
+      append({ kind: "system", text: `✦ ${a.intent}  ${a.text}  (${ms}ms)` });
+    },
+    onVoiceSet: (v) => {
+      if (v.voice) append({ kind: "system", text: `→ 切到 voice ${v.voice} (${v.provider})` });
+    },
+    onPolishSet: (p) => {
+      append({ kind: "system", text: `polish = ${p.enabled ? "on" : "off"}` });
+    },
   });
+
+  // Fade out lastAction + retryBanner after their `until` ms — simple
+  // interval that no-ops when both are clear.
+  useEffect(() => {
+    const t = setInterval(() => {
+      const now = Date.now();
+      if (lastAction && now > lastAction.until) setLastAction(null);
+      if (retryBanner && now > retryBanner.until) setRetryBanner(null);
+    }, 500);
+    return () => clearInterval(t);
+  }, [lastAction, retryBanner]);
 
   // Cold-load: hydrate the conversation panel from SQLite (read-only —
   // server-side LLM history is per-session, but ASR transcripts persist).
@@ -731,6 +861,34 @@ export default function App() {
     }
   };
 
+  /* Tauri global shortcut bridge — the Rust side emits
+     ``voice-toggle-record`` when ⌘⇧Space fires anywhere on the OS;
+     here we toggle the in-app recording state to match. In a plain
+     browser tab (no Tauri runtime), the import gracefully no-ops. */
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    (async () => {
+      try {
+        const tauriEvent = await import("@tauri-apps/api/event");
+        if (cancelled) return;
+        unlisten = await tauriEvent.listen("voice-toggle-record", () => {
+          if (ws.recording) {
+            onPressEnd();
+          } else {
+            onPressStart();
+          }
+        });
+      } catch {
+        // Running in a browser tab — Tauri runtime unavailable, that's fine.
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [ws.recording, onPressStart, onPressEnd]);
+
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
@@ -804,6 +962,98 @@ export default function App() {
         </div>
       </header>
 
+      {/* Workspace bar — dedicated row so the active ablework sandbox is
+          always visible. Click the chip to toggle the list panel. */}
+      <div className="border-b border-(--color-border) bg-(--color-bg) px-6 py-2 text-xs flex items-center gap-3">
+        <span className="text-(--color-muted)">📁 工作区</span>
+        <button
+          type="button"
+          onClick={() => setWsListOpen((v) => !v)}
+          className={`rounded-md px-2 py-0.5 transition border ${
+            currentWs.name
+              ? "border-(--color-warn) bg-(--color-warn)/15 text-(--color-warn) font-medium hover:bg-(--color-warn)/25"
+              : "border-(--color-border) text-(--color-muted) italic hover:border-(--color-accent)"
+          }`}
+          title='点击展开工作区列表(或说 "切到 X 工作区")'
+        >
+          {currentWs.name || "(默认 sandbox)"}
+        </button>
+        {lastAction && (
+          <span className="text-(--color-accent) font-medium">{lastAction.text}</span>
+        )}
+        <div className="flex-1" />
+        {workspaces.length > 0 && (
+          <span className="text-(--color-muted)">共 {workspaces.length} 个</span>
+        )}
+        <button
+          type="button"
+          onClick={() => ws.send({ type: "refresh_workspaces" })}
+          className="text-(--color-muted) hover:text-(--color-accent) px-1"
+          title="重新拉取工作区列表"
+        >⟳</button>
+      </div>
+
+      {/* Workspace list panel — slides down when open. Click name → set_workspace. */}
+      {wsListOpen && (
+        <div className="border-b border-(--color-border) bg-(--color-panel) px-6 py-3 max-h-64 overflow-y-auto">
+          <div className="mx-auto max-w-3xl flex flex-col gap-1">
+            <div className="text-xs text-(--color-muted) mb-1">
+              点击切换 · 说 "新建 X 工作区" 创建 · 说 "把对话搬到 X" 移动当前对话
+            </div>
+            {workspaces.length === 0 && (
+              <div className="text-sm text-(--color-muted) italic">列表为空 — 点 ⟳ 重新拉取</div>
+            )}
+            {workspaces.map((w) => {
+              const active = w.id === currentWs.id;
+              return (
+                <button
+                  key={w.id}
+                  type="button"
+                  onClick={() => {
+                    ws.send({ type: "set_workspace", id: w.id });
+                    setWsListOpen(false);
+                  }}
+                  className={`flex items-center justify-between rounded px-2 py-1.5 text-sm transition text-left ${
+                    active
+                      ? "bg-(--color-warn)/15 text-(--color-warn) font-medium"
+                      : "hover:bg-(--color-bg)"
+                  }`}
+                >
+                  <span>{w.name}</span>
+                  <span className="text-xs text-(--color-muted) ml-2">
+                    {active && "✓ 当前 · "}{w.id.slice(0, 8)}
+                  </span>
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              onClick={() => {
+                ws.send({ type: "set_workspace", id: "" });
+                setWsListOpen(false);
+              }}
+              className="mt-2 rounded px-2 py-1.5 text-sm text-(--color-muted) italic hover:bg-(--color-bg) text-left"
+            >
+              ↩ 回到默认 sandbox(无工作区)
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Retry banner — auto-fade after a few seconds */}
+      {retryBanner && (
+        <div className="border-b border-(--color-warn)/40 bg-(--color-warn)/10 px-6 py-1.5 text-xs text-(--color-warn) text-center">
+          {retryBanner.text}
+        </div>
+      )}
+
+      {/* Polish-in-flight banner */}
+      {polishing && (
+        <div className="border-b border-(--color-accent)/40 bg-(--color-accent)/10 px-6 py-1 text-xs text-(--color-accent) text-center">
+          ✨ 整理中…
+        </div>
+      )}
+
       {/* Conversation */}
       <section ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-8">
         <div className="mx-auto flex max-w-3xl flex-col gap-4">
@@ -847,12 +1097,27 @@ export default function App() {
                 )}
               </div>
             ) : undefined;
+            const showPolishDiff = e.kind === "user" && e.raw && e.raw !== e.text;
             const content =
               e.kind === "assistant" && e.streaming ? (
                 <>
                   {e.text || <span className="text-(--color-muted) italic">思考中…</span>}
                   <span className="ml-0.5 inline-block w-1.5 h-4 -mb-0.5 bg-(--color-accent) animate-pulse" />
                 </>
+              ) : showPolishDiff ? (
+                // Polish changed the text — show polished (bold) above,
+                // raw (struck-through dim) below so user sees the diff.
+                <div className="flex flex-col gap-1">
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium">{e.text}</span>
+                    <span className="text-[10px] text-(--color-accent) px-1.5 py-0.5 rounded bg-(--color-accent)/10">
+                      ✨ 已整理{e.polishMs ? ` ${e.polishMs}ms` : ""}
+                    </span>
+                  </div>
+                  <div className="text-xs text-(--color-muted) line-through opacity-70">
+                    原:{e.raw}
+                  </div>
+                </div>
               ) : (
                 e.text
               );

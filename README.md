@@ -67,16 +67,21 @@ python3 -m venv .venv
 cd demo-ui && npm install && cd ..
 ```
 
-### 启动方式(三选一)
+### 启动方式(四选一)
 
 ```bash
-# A. 终端 TUI(textual)— 推荐日常用
+# A. 终端 TUI(textual)— SSH / headless 场景 / 快速测试
 ./start-tui.sh
 
-# B. 浏览器 UI(Vite :5173 + server :8501)
+# B. 浏览器 UI(Vite :5173 + server :8501)— 调样式时方便
 ./start.sh         # 然后开 http://127.0.0.1:5173
 
-# C. 只起 server(自己写 client)
+# C. 桌面 app(Tauri,推荐日常用)— 系统托盘 + 全局快捷键 ⌘⇧Space
+./start.sh &                                          # 起 server
+cd demo-ui && npm run tauri:dev                       # 起 Tauri 窗口
+# 生产打包:cd demo-ui && npm run tauri:build → src-tauri/target/release/
+
+# D. 只起 server(自己写 client)
 .venv/bin/uvicorn server:app --host 127.0.0.1 --port 8501
 ```
 
@@ -237,9 +242,13 @@ ablework agent 5-6s 是 backend 端 RAG/tool pipeline 固有延迟,跟 voice 客
 │   ├── fixtures/                #   test_zh*.wav / test_zh2*.aiff 测试音频
 │   ├── conftest.py              #   live_server session fixture
 │   └── README.md                #   测试规约 + 啥时候写什么
-├── demo-ui/                     # Vite + React + Tailwind UI
+├── demo-ui/                     # Vite + React + Tailwind UI (+ Tauri 桌面壳)
 │   ├── src/App.tsx              #   单文件 UI + useVoiceWS hook
-│   └── public/pcm-worklet.js    #   AudioWorklet processor
+│   ├── public/pcm-worklet.js    #   AudioWorklet processor
+│   └── src-tauri/               #   Rust Tauri wrapper (托盘 + 全局快捷键)
+│       ├── Cargo.toml
+│       ├── src/lib.rs           #   tray icon + ⌘⇧Space global shortcut
+│       └── tauri.conf.json      #   window / bundle 配置
 ├── recordings/                  # opt-in audio store(KEEP_AUDIO=1 才存)
 ├── docs/done/daily_record/      # 工作日记(gitignored)
 ├── ADR-001-...md                # 架构决策
