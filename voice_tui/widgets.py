@@ -93,10 +93,8 @@ class StatusBar(Static):
         # polish on/off chip
         if not self.polish_enabled:
             t.append("  polish:off", style="dim red")
-        # workspace chip — empty = default sandbox
-        if self.workspace_name:
-            t.append("  WS:", style="dim")
-            t.append(self.workspace_name, style="bold yellow")
+        # NOTE: workspace info moved to dedicated WorkspaceBar widget
+        # so it gets more visual weight than a tiny chip — see app.py
         # latency
         if self.last_first_audio_ms:
             t.append("  ★首音 ", style="dim")
@@ -105,6 +103,59 @@ class StatusBar(Static):
             t.append("  total ", style="dim")
             t.append(f"{self.last_total_ms}ms", style="green")
         return t
+
+
+class WorkspaceBar(Static):
+    """Dedicated row showing the current ablework workspace + count +
+    hotkey hint. Sits right under the StatusBar so the user always
+    knows which sandbox their next chat will run in — much more
+    visible than a tiny chip in the status row.
+
+    Styling rationale: when in a workspace, use a yellow-on-blue chip
+    that pops; when at default sandbox, show dim italic so empty is
+    quietly explained, not silently absent."""
+    workspace_name = reactive("")
+    workspace_count = reactive(0)
+    last_action = reactive("")          # "已切换" / "已搬到" / "已创建" etc
+    last_action_until = reactive(0.0)   # monotonic timestamp — fade after 4s
+
+    def on_mount(self) -> None:
+        # 4 fps tick to fade the action label after ~4s.
+        self.set_interval(0.25, self._maybe_refresh)
+
+    def _maybe_refresh(self) -> None:
+        if self.last_action and time.monotonic() > self.last_action_until:
+            self.last_action = ""
+            self.last_action_until = 0.0
+        if self.last_action:   # animate
+            self.refresh()
+
+    def render(self):
+        t = Text()
+        t.append("  📁 工作区 ", style="dim")
+        if self.workspace_name:
+            t.append(f" {self.workspace_name} ",
+                     style="bold black on yellow")
+        else:
+            t.append("(默认 sandbox)", style="dim italic")
+        # Recent action — fades after 4s so user knows what just happened
+        if self.last_action:
+            t.append("   ", style="")
+            t.append(self.last_action, style="bold magenta")
+        # Right-side hint: total count + hotkey
+        if self.workspace_count:
+            t.append(f"     ", style="")
+            t.append(f"共 {self.workspace_count} 个", style="dim")
+            t.append("   按 ", style="dim")
+            t.append("W", style="bold cyan")
+            t.append(" 切换 / 列表", style="dim")
+        return t
+
+    def flash_action(self, text: str, *, seconds: float = 4.0) -> None:
+        """Set a transient action label that auto-fades."""
+        self.last_action = text
+        self.last_action_until = time.monotonic() + seconds
+        self.refresh()
 
 
 class Conversation(Static):
@@ -152,6 +203,12 @@ class Conversation(Static):
 
     def append_system(self, text: str) -> None:
         self.append(Message("system", text))
+
+    def append_divider(self, text: str) -> None:
+        """Visually-distinct row rendered with rule chars on both sides.
+        Used when workspace switches so the conversation log clearly
+        shows the boundary between turns in old vs new workspace."""
+        self.append(Message("divider", text))
 
     def replace_at(self, idx: int, *, text: str | None = None,
                    info: str | None = None, streaming: bool | None = None,
@@ -202,8 +259,15 @@ class Conversation(Static):
                 renderables.append(self._render_user(m, frame))
             elif m.role == "assistant":
                 renderables.append(self._render_assistant(m, frame))
-            else:  # system
-                renderables.append(Text(f"  · {m.text}", style="dim italic"))
+            elif m.role == "divider":
+                # Bold workspace-transition rule, full-width.
+                renderables.append(Text.from_markup(
+                    f"  [bold magenta]── {m.text} ──[/bold magenta]"
+                ))
+            else:  # system — allow [yellow]/[bold]/etc markup from caller
+                renderables.append(Text.from_markup(
+                    f"  · {m.text}", style="dim italic",
+                ))
         return Group(*renderables) if renderables else Text("")
 
     @staticmethod

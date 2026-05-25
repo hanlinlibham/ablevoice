@@ -48,7 +48,7 @@ from .config import (
 from .devices import format_input_devices, resolve_input_device
 from .models import Message
 from .recorder import Recorder
-from .widgets import Conversation, MicMeter, StatusBar
+from .widgets import Conversation, MicMeter, StatusBar, WorkspaceBar
 from .ws import WsClient
 
 log = setup_logging()
@@ -58,10 +58,11 @@ class VoiceTUI(App):
     """Terminal client for the voice loop."""
     CSS = """
     Screen { background: $surface; }
-    StatusBar { dock: top; height: 1; padding: 0 1; background: $boost; }
+    StatusBar    { dock: top; height: 1; padding: 0 1; background: $boost; }
+    WorkspaceBar { dock: top; height: 1; padding: 0 1; background: $panel; }
     Conversation { padding: 1 2; }
-    MicMeter { dock: bottom; height: 1; padding: 0 1; }
-    Footer { background: $boost; }
+    MicMeter     { dock: bottom; height: 1; padding: 0 1; }
+    Footer       { background: $boost; }
     """
     BINDINGS = [
         Binding("space", "toggle_record", "Record (Space)"),
@@ -71,6 +72,8 @@ class VoiceTUI(App):
         Binding("v",     "cycle_voice_mlx",       "Voice ▾"),
         Binding("V",     "cycle_voice_dashscope", "Cloud voice ▾"),
         Binding("p",     "toggle_polish",         "Polish on/off"),
+        Binding("w",     "list_workspaces",       "Workspace list"),
+        Binding("W",     "refresh_workspaces",    "Refresh ws list"),
         Binding("q",     "quit",      "Quit"),
     ]
 
@@ -92,11 +95,17 @@ class VoiceTUI(App):
         self._polish_enabled = True
         # Drafts available to recover (set on server-side notification)
         self._pending_drafts: list[dict] = []
+        # Workspace cache mirrored from server's workspace_list event so
+        # the W hotkey can show the list locally without round-tripping.
+        self._ws_list: list[dict] = []
+        self._ws_current_id: str | None = None
+        self._ws_current_name: str = ""
 
     # ── layout ────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield StatusBar(id="status")
+        yield WorkspaceBar(id="ws")
         with VerticalScroll(id="body"):
             yield Conversation(id="conv")
         yield MicMeter(id="mic")
@@ -368,30 +377,60 @@ class VoiceTUI(App):
 
     async def _h_workspace_list(self, ev: dict) -> None:
         """Server pushes the workspace list at hello time + on refresh.
-        Update StatusBar's workspace_name with the current active one.
-        Also cache the list so a future 'show me workspaces' UI can use
-        it without re-fetching."""
-        try:
-            status = self.query_one("#status", StatusBar)
-        except Exception:
-            return
-        current_name = ev.get("current_name") or ""
-        status.workspace_name = current_name
+        Cache locally so the W hotkey can show the list without round-
+        trip; update WorkspaceBar's count + current name."""
         rows = ev.get("workspaces", [])
-        if rows:
-            n = len(rows)
-            tag = f" ({current_name})" if current_name else ""
-            self._sys(f"[dim]工作区已加载:{n} 个{tag}[/dim]")
+        self._ws_list = rows
+        self._ws_current_id = ev.get("current_id")
+        self._ws_current_name = ev.get("current_name") or ""
+        try:
+            ws = self.query_one("#ws", WorkspaceBar)
+            ws.workspace_count = len(rows)
+            ws.workspace_name = self._ws_current_name
+        except Exception:
+            pass
+        # Quiet system note — first-time load is informational, refreshes
+        # are loud (caller used the W hotkey explicitly).
+        self._sys(f"[dim]工作区已加载:{len(rows)} 个[/dim]")
 
     async def _h_workspace_changed(self, ev: dict) -> None:
         """A workspace op (set_workspace / ws_switch / ws_create / ws_move
-        / ws_leave) completed. Update StatusBar."""
+        / ws_leave) completed. Update WorkspaceBar + drop a divider
+        into the conversation so the transition is visually clear."""
+        name = (ev.get("name") or "").strip()
+        prev_name = self._ws_current_name
+        self._ws_current_id = ev.get("id")
+        self._ws_current_name = name
         try:
-            status = self.query_one("#status", StatusBar)
+            ws = self.query_one("#ws", WorkspaceBar)
+            ws.workspace_name = name
         except Exception:
-            return
-        name = ev.get("name") or ""
-        status.workspace_name = name
+            pass
+        # Drop a divider line into the conversation log so the user
+        # sees a clean break between old-ws turns and new-ws turns.
+        # Also flash WorkspaceBar's "last_action" so the change is
+        # also visible in the header for a few seconds.
+        intent = ev.get("intent", "")
+        action_label = {
+            "ws_switch":     "已切换到",
+            "ws_create":     "已新建并切入",
+            "ws_move":       "已搬到",
+            "ws_leave":      "已退出",
+            "set_workspace": "已切到",
+        }.get(intent, "→")
+        try:
+            conv = self.query_one("#conv", Conversation)
+            if name:
+                conv.append_divider(f"{action_label} {name}")
+            else:
+                conv.append_divider("已退出工作区(回到默认 sandbox)")
+            ws = self.query_one("#ws", WorkspaceBar)
+            ws.flash_action(
+                f"✦ {action_label} {name or '默认'}",
+                seconds=4.0,
+            )
+        except Exception:
+            pass
 
     async def _h_intent_ack(self, ev: dict) -> None:
         """Server handled an intent — show the ack text as a system
@@ -402,6 +441,29 @@ class VoiceTUI(App):
         ms = ev.get("ms_classify", 0) + ev.get("ms_handle", 0)
         if text:
             self._sys(f"[magenta bold]✦ {intent}[/magenta bold] {text}  [dim]({ms}ms)[/dim]")
+
+    # ── workspace hotkeys ────────────────────────────────────────────
+
+    def action_list_workspaces(self) -> None:
+        """Show cached workspaces inline as system messages — quick
+        scan without modal complexity."""
+        if not self._ws_list:
+            self._sys("[yellow]工作区列表为空 — 按 [bold]W[/bold] 强制重新拉取[/yellow]")
+            return
+        self._sys(f"[bold cyan]工作区列表[/bold cyan]([cyan]{len(self._ws_list)}[/cyan] 个,当前:[bold yellow]{self._ws_current_name or '默认 sandbox'}[/bold yellow]):")
+        for i, w in enumerate(self._ws_list, 1):
+            name = w.get("name", "?")
+            wid = (w.get("id") or "")[:8]
+            mark = " [bold magenta]← 当前[/bold magenta]" if w.get("id") == self._ws_current_id else ""
+            self._sys(f"  [dim cyan]{i:>2}.[/dim cyan] [bold]{name}[/bold] [dim]({wid})[/dim]{mark}")
+        self._sys("[dim]说 \"切到 <名字>\" 或 \"新建一个 <名字> 工作区\" 切换/创建[/dim]")
+
+    def action_refresh_workspaces(self) -> None:
+        """Force a server-side re-fetch of /workspaces."""
+        if self.ws_client is None:
+            return
+        self._sys("[yellow]重新拉取工作区列表…[/yellow]")
+        asyncio.create_task(self.ws_client.send_json({"type": "refresh_workspaces"}))
 
     async def _h_retry(self, ev: dict) -> None:
         """Server retried a transient upstream failure (5xx / connection
