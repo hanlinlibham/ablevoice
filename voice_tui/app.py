@@ -33,7 +33,7 @@ import sounddevice as sd
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
-from textual.widgets import Footer, Header
+from textual.widgets import Footer, Header, Input
 
 from .audio import AudioStreamer
 from .config import (
@@ -61,6 +61,8 @@ class VoiceTUI(App):
     StatusBar    { dock: top; height: 1; padding: 0 1; background: $boost; }
     WorkspaceBar { dock: top; height: 1; padding: 0 1; background: $panel; }
     Conversation { padding: 1 2; }
+    Input#composer { dock: bottom; height: 3; margin: 0 1; border: round $primary-darken-2; }
+    Input#composer:focus { border: round $primary; }
     MicMeter     { dock: bottom; height: 1; padding: 0 1; }
     Footer       { background: $boost; }
     """
@@ -74,6 +76,8 @@ class VoiceTUI(App):
         Binding("p",     "toggle_polish",         "Polish on/off"),
         Binding("w",     "list_workspaces",       "Workspace list"),
         Binding("W",     "refresh_workspaces",    "Refresh ws list"),
+        Binding("t",     "focus_composer",        "Type (t)"),
+        Binding("escape", "blur_composer",        "语音模式", show=False),
         Binding("q",     "quit",      "Quit"),
     ]
 
@@ -108,6 +112,7 @@ class VoiceTUI(App):
         yield WorkspaceBar(id="ws")
         with VerticalScroll(id="body"):
             yield Conversation(id="conv")
+        yield Input(id="composer", placeholder="t 打字对话 · Enter 发送 · Esc 切回语音(Space 录音)")
         yield MicMeter(id="mic")
         yield Footer()
 
@@ -115,7 +120,7 @@ class VoiceTUI(App):
     async def on_mount(self) -> None:
         conv = self.query_one("#conv", Conversation)
         conv.append_system(
-            "Space 录音 · i 打断 · r 重置 · R 恢复 · v/V 换声 · p polish · q 退出"
+            "Space 录音 · t 打字 · i 打断 · r 重置 · R 恢复 · v/V 换声 · p polish · q 退出"
         )
         # Mic device intro — same diagnostic as before. Helps users
         # spot virtual routing devices that PortAudio sometimes picks
@@ -180,6 +185,9 @@ class VoiceTUI(App):
         asyncio.create_task(self.ws_client.run(), name="ws-loop")
         # Background poll: AudioStreamer.busy → status.playing.
         asyncio.create_task(self._poll_playing(), name="playing-poll")
+        # Don't let the composer Input grab initial focus — keep Space
+        # bound to record by default. ``t`` focuses the composer to type.
+        self.set_focus(None)
 
     async def on_unmount(self) -> None:
         if self.recorder is not None:
@@ -589,6 +597,45 @@ class VoiceTUI(App):
                 "peak_level": round(peak, 4),
             })
             status.last_first_audio_ms = 0
+
+    # ── text input (typed chat) ──────────────────────────────────────
+    def action_focus_composer(self) -> None:
+        self.query_one("#composer", Input).focus()
+
+    def action_blur_composer(self) -> None:
+        # Back to voice mode — Space records again.
+        self.set_focus(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "composer":
+            return
+        text = (event.value or "").strip()
+        event.input.value = ""
+        self.set_focus(None)
+        if text:
+            asyncio.create_task(self._send_text_message(text))
+
+    async def _send_text_message(self, text: str) -> None:
+        """Typed chat turn — same conversation as voice, minus ASR/polish.
+        Render the user + streaming assistant bubbles locally (server
+        doesn't echo typed text), then let the normal token/audio_chunk/
+        chat_done handlers fill the reply."""
+        if self.ws_client is None:
+            return
+        conv = self.query_one("#conv", Conversation)
+        status = self.query_one("#status", StatusBar)
+        # A fresh turn supersedes any in-flight reply (server cancels the
+        # old chat); close the previous streaming bubble so it doesn't
+        # dangle, then open a new pair.
+        if status.chatting:
+            conv.finalize_streaming_assistant(info="superseded")
+        conv.append(Message("user", text, info="typed"))
+        conv.append(Message("assistant", "", info="", streaming=True))
+        status.chatting = True
+        status.polishing = False
+        self.first_audio_logged = False
+        self.turn_t_stop = time.monotonic()
+        await self.ws_client.send_json({"type": "text_message", "text": text})
 
     def action_interrupt(self) -> None:
         if self.ws_client is None:

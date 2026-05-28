@@ -596,7 +596,7 @@ export default function App() {
         "按住 ⏺ 录音按钮(或 Space)说话 — 边录边把 16kHz PCM 推给 server;" +
         "松开后:转写 → 流式 LLM → 句级 TTS → 顺序播放。" +
         "AI 说话时再按录音键会立刻打断;header 的「重置」清空对话。" +
-        "底部输入框可以单独试 TTS。",
+        "底部输入框直接打字也能对话(Enter 发送),回复同样会语音播报;🔊 按钮仅试听 TTS 不进对话。",
     },
   ]);
   const [historyLoaded, setHistoryLoaded] = useState(false);
@@ -648,6 +648,22 @@ export default function App() {
       ...prev,
       { id: e.id ?? `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, ...e },
     ]);
+  }, []);
+
+  // Open a streaming assistant bubble + reset per-turn timing refs. Shared
+  // by the voice path (after transcript) and the typed-text path (on
+  // composer submit) so both render replies identically.
+  const beginAssistantTurn = useCallback(() => {
+    const assistantId = `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    activeAssistantIdRef.current = assistantId;
+    turnT0Ref.current = performance.now();
+    firstTokenAtRef.current = null;
+    firstAudioAtRef.current = null;
+    setEntries((prev) => [
+      ...prev,
+      { id: assistantId, kind: "assistant", text: "", streaming: true, audioChunks: 0 },
+    ]);
+    setChatting(true);
   }, []);
 
   const ws = useVoiceWS(sessionId, {
@@ -726,16 +742,7 @@ export default function App() {
       }
       // The server auto-triggers chat from here — prepare a placeholder
       // assistant bubble so token/audio events have a row to append to.
-      const assistantId = `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      activeAssistantIdRef.current = assistantId;
-      turnT0Ref.current = performance.now();
-      firstTokenAtRef.current = null;
-      firstAudioAtRef.current = null;
-      setEntries((prev) => [
-        ...prev,
-        { id: assistantId, kind: "assistant", text: "", streaming: true, audioChunks: 0 },
-      ]);
-      setChatting(true);
+      beginAssistantTurn();
     },
     onAssistantToken: (delta) => {
       if (firstTokenAtRef.current === null) {
@@ -953,6 +960,20 @@ export default function App() {
     audioQueue.stop();
     ws.ttsOneShot(t);
   }, [ttsText, composerBusy, audioQueue, ws]);
+
+  // Typed chat turn — same conversation as voice. Render the user bubble
+  // locally (the text is already known; server doesn't echo it), open the
+  // assistant bubble, then send. Reply streams token/audio/chat_done via
+  // the existing handlers.
+  const submitComposerChat = useCallback(() => {
+    const t = ttsText.trim();
+    if (!t || chatting || !ws.connected) return;
+    audioQueue.stop();
+    append({ kind: "user", text: t });
+    beginAssistantTurn();
+    ws.send({ type: "text_message", text: t });
+    setTtsText("");
+  }, [ttsText, chatting, audioQueue, append, beginAssistantTurn, ws]);
 
   const resetConversation = useCallback(() => {
     ws.interrupt();
@@ -1290,26 +1311,35 @@ export default function App() {
             <Mic size={16} className="text-(--color-text)" />
           )}
         </button>
-        {/* Compose TTS — quick voice test */}
+        {/* Composer — type to chat (Enter / 发送), or 🔊 to try TTS only */}
         <form
           className="flex flex-1 items-center gap-2"
-          onSubmit={(e) => { e.preventDefault(); submitComposerTts(); }}
+          onSubmit={(e) => { e.preventDefault(); submitComposerChat(); }}
         >
           <input
             type="text"
             value={ttsText}
             onChange={(ev) => setTtsText(ev.target.value)}
-            placeholder='试合成 TTS · 或按住录音按钮说话'
+            placeholder='输入文字对话 · 或按住录音按钮说话'
             className="flex-1 rounded border border-(--color-border) bg-(--color-bg) px-3 py-1.5 text-sm placeholder:text-(--color-muted)/60 focus:outline-none focus:border-(--color-accent)"
           />
           <button
-            type="submit"
+            type="button"
+            onClick={submitComposerTts}
             disabled={!ttsText.trim() || composerBusy || !ws.connected}
             className="inline-flex items-center gap-1 rounded border border-(--color-border) bg-(--color-bg) px-2.5 py-1.5 text-sm transition hover:border-(--color-accent) hover:text-(--color-accent) disabled:opacity-40 disabled:cursor-not-allowed"
-            title="合成并播放"
+            title="仅合成播放(不进对话)"
           >
-            {composerBusy ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
-            合成
+            {composerBusy ? <Loader2 size={13} className="animate-spin" /> : <Volume2 size={13} />}
+          </button>
+          <button
+            type="submit"
+            disabled={!ttsText.trim() || chatting || !ws.connected}
+            className="inline-flex items-center gap-1 rounded border border-(--color-border) bg-(--color-bg) px-2.5 py-1.5 text-sm transition hover:border-(--color-accent) hover:text-(--color-accent) disabled:opacity-40 disabled:cursor-not-allowed"
+            title="发送到对话(Enter)"
+          >
+            {chatting ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
+            发送
           </button>
         </form>
       </div>

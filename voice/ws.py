@@ -8,6 +8,7 @@ Client → Server
            {"type": "start_recording", "sample_rate": 16000}
            {"type": "stop_recording", "peak_level": 0.0..1.0}
            {"type": "interrupt"}                          (cancel chat)
+           {"type": "text_message", "text": "..."}        (typed chat turn)
            {"type": "tts", "text": "..."}                 (one-shot TTS)
            {"type": "reset"}                              (clear history)
 
@@ -525,7 +526,14 @@ class WsSession:
 
         # Spawn chat — cancellable via interrupt/new_recording. Pass
         # ``polished_text`` so chat.py doesn't repeat the polish call.
-        sid = self.session_id
+        self._spawn_chat(said, chat_input)
+
+    def _spawn_chat(self, said: str, chat_input: str) -> None:
+        """Start a cancellable chat turn shared by the voice and typed
+        input paths. ``said`` is the raw user text (history/logging);
+        ``chat_input`` is what the LLM actually sees — polished text for
+        voice, the raw typed text for the composer."""
+        sid = self.session_id or ""
 
         async def emit(ev_name: str, data: dict) -> None:
             payload = {"type": ev_name if ev_name != "done" else "chat_done", **data}
@@ -545,6 +553,45 @@ class WsSession:
             ),
             name=f"chat-{sid[:8]}",
         )
+
+    async def handle_text_message(self, ev: dict) -> None:
+        """Typed-input path — runs the same chat pipeline as a voice turn,
+        minus ASR + polish (typed text has no ASR artifacts to clean).
+        Intent classification still runs so typed workspace ops ("切到 X")
+        work. The reply streams identical meta / token / audio_chunk /
+        chat_done events, so text and voice are interchangeable inputs to
+        a single conversation."""
+        text = (ev.get("text") or "").strip()
+        if not text:
+            await self.send_json({"type": "error", "where": "text_message",
+                                  "message": "empty text"})
+            return
+        # A fresh turn supersedes any in-flight reply, mirroring how a new
+        # recording would. Cancel silently — the user deliberately started
+        # a new turn, so no "interrupted" flash is warranted.
+        if self.chat_task is not None and not self.chat_task.done():
+            self.chat_task.cancel()
+            try:
+                await self.chat_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self.chat_task = None
+
+        logger.info("ws text_message session=%s → %r",
+                    (self.session_id or "?")[:8], text[:60])
+
+        # Intent (workspace ops) on the typed text — same as the voice path.
+        try:
+            intent_result = await process_intent(text, self)
+        except Exception:  # noqa: BLE001
+            logger.exception("process_intent crashed — falling through to chat")
+            intent_result = None
+        if intent_result is not None and intent_result.handled:
+            await self._emit_intent_ack(intent_result)
+            return
+
+        # Typed text is already clean — feed it to the LLM verbatim.
+        self._spawn_chat(text, text)
 
     async def handle_interrupt(self, ev: dict) -> None:
         await self.cancel_chat("user_interrupt")
@@ -658,6 +705,7 @@ class WsSession:
         "start_recording":    "handle_start_recording",
         "stop_recording":     "handle_stop_recording",
         "interrupt":          "handle_interrupt",
+        "text_message":       "handle_text_message",
         "tts":                "handle_tts",
         "reset":              "handle_reset",
         "set_voice":          "handle_set_voice",
