@@ -87,6 +87,8 @@ async def run_chat_pipeline(
     polished_text: Optional[str] = None,
     voice_override: Optional[str] = None,
     workspace_id: Optional[str] = None,
+    speech_rate_override: Optional[float] = None,
+    volume_override: Optional[float] = None,
 ) -> dict:
     """Run one chat turn — (optional) polish → LLM streaming + sentence-
     level TTS — and push progress to ``emit``. Transport-agnostic (called
@@ -144,7 +146,11 @@ async def run_chat_pipeline(
 
     # Try the streaming TTS path. Providers without duplex support
     # return None; we fall through to the per-sentence path below.
-    stream_sess = tts.stream(voice=voice_override)
+    stream_sess = tts.stream(
+        voice=voice_override,
+        speech_rate=speech_rate_override,
+        volume=volume_override,
+    )
     if stream_sess is not None:
         try:
             await stream_sess.open()

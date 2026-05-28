@@ -53,6 +53,7 @@ from .chat import synth_one
 from .config import settings
 from .intents import process_intent
 from .intents.workspace_cache import WorkspaceCache
+from .meta_commands import MetaCommand, MetaMatch, match as match_meta_command
 from .polish import polish_text
 from .providers import get_asr
 from .providers.base import AsrSession
@@ -84,6 +85,11 @@ class WsSession:
         self.voice_override: Optional[str] = None
         self.tts_provider_override: Optional[str] = None  # "mlx" | "dashscope"
         self.polish_override: Optional[bool] = None       # None = use global default
+        # TTS prosody overrides — driven by meta-command fast-path ("慢点" /
+        # "快点" / "大声点" / "小声点"). None means "use settings.tts default".
+        # Persists until the user adjusts again or session ends.
+        self.speech_rate_override: Optional[float] = None
+        self.volume_override: Optional[float] = None
         # Per-session workspace state — voice intent classifier (or
         # explicit set_workspace WS event) sets workspace_override; cache
         # is the list of available workspaces fetched at hello-time and
@@ -158,6 +164,66 @@ class WsSession:
             })
         except Exception:
             logger.exception("intent ack TTS failed (text was sent already)")
+
+    # --- Meta-command handler ----------------------------------------------
+
+    async def _handle_meta_command(self, meta: MetaMatch) -> None:
+        """Execute a fast-path meta-command. STOP cancels the running
+        chat; SLOWER/FASTER adjust speech_rate_override; LOUDER/QUIETER
+        adjust volume_override. RESUME/REPLAY are acknowledged here but
+        their playback effect lives client-side (server has no audio
+        cache to replay). All paths emit ``meta_command_ack`` + TTS the
+        ack text so the user hears confirmation."""
+        cmd = meta.command
+        notes: dict = {"command": cmd.value, "phrase": meta.matched_phrase}
+
+        if cmd is MetaCommand.STOP:
+            await self.cancel_chat("user_meta_stop")
+        elif cmd is MetaCommand.SLOWER:
+            cur = self.speech_rate_override if self.speech_rate_override is not None else settings.tts.speech_rate
+            self.speech_rate_override = max(0.5, round(cur - 0.2, 2))
+            notes["speech_rate"] = self.speech_rate_override
+        elif cmd is MetaCommand.FASTER:
+            cur = self.speech_rate_override if self.speech_rate_override is not None else settings.tts.speech_rate
+            self.speech_rate_override = min(2.0, round(cur + 0.2, 2))
+            notes["speech_rate"] = self.speech_rate_override
+        elif cmd is MetaCommand.LOUDER:
+            cur = self.volume_override if self.volume_override is not None else settings.tts.volume
+            self.volume_override = min(100.0, round(cur + 15.0, 1))
+            notes["volume"] = self.volume_override
+        elif cmd is MetaCommand.QUIETER:
+            cur = self.volume_override if self.volume_override is not None else settings.tts.volume
+            self.volume_override = max(0.0, round(cur - 15.0, 1))
+            notes["volume"] = self.volume_override
+        # RESUME / REPLAY — server-side no-op; client-side replay UX TBD.
+
+        logger.info(
+            "ws meta_command session=%s %s → %s",
+            (self.session_id or "?")[:8], cmd.value, notes,
+        )
+        await self.send_json({"type": "meta_command_ack", **notes})
+
+        # Speak the ack so the user hears confirmation. TTS failure is
+        # non-fatal — the meta_command_ack JSON above already conveyed
+        # the state change, audio is just the natural feedback.
+        ack = meta.ack_text.strip()
+        if not ack:
+            return
+        try:
+            from .audio import strip_tts_unfriendly
+            wav_bytes, sr, n_samples = await synth_one(
+                strip_tts_unfriendly(ack), voice=self.voice_override,
+            )
+            if not wav_bytes:
+                return
+            dur_ms = int(1000 * n_samples / sr) if n_samples and sr else 0
+            b64 = base64.b64encode(wav_bytes).decode("ascii")
+            await self.send_json({
+                "type": "audio_chunk", "text": ack, "b64": b64,
+                "dur_ms": dur_ms, "synth_ms": 0, "idx": 0,
+            })
+        except Exception:
+            logger.exception("meta_command ack TTS failed (text was sent already)")
 
     # --- SessionCtx adapter (for voice.intents.handlers) -------------------
 
@@ -392,6 +458,16 @@ class WsSession:
         if not said:
             return
 
+        # Meta-command fast path — deterministic short commands
+        # ("停"/"慢点"/"大声点" etc.) bypass polish + LLM intent classify
+        # + chat entirely. Saves ~3s for these high-frequency control
+        # utterances. Only triggers when duration AND text-length gates
+        # both hold (see voice.meta_commands for the exact rule).
+        meta = match_meta_command(said, duration_ms=total_ms)
+        if meta is not None:
+            await self._handle_meta_command(meta)
+            return
+
         # Polish the transcript before chat. Per-session ``polish_override``
         # (settable via ``set_polish`` WS event from the TUI) wins; falls
         # back to global ``settings.polish.enabled`` otherwise. When
@@ -464,6 +540,8 @@ class WsSession:
                 polished_text=chat_input,
                 voice_override=self.voice_override,
                 workspace_id=effective_ws or None,
+                speech_rate_override=self.speech_rate_override,
+                volume_override=self.volume_override,
             ),
             name=f"chat-{sid[:8]}",
         )

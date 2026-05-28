@@ -162,8 +162,11 @@ class MlxTts:
     async def synth(self, text: str, *, voice: str | None = None) -> tuple[bytes, int, int]:
         return await mlx_call(_synth_mlx_sync, text, voice)
 
-    def stream(self, *, voice: str | None = None):  # noqa: ARG002
+    def stream(self, *, voice: str | None = None,    # noqa: ARG002
+               speech_rate: float | None = None,
+               volume: float | None = None):
         # MLX path is one-shot; chat.py falls back to synth() per sentence.
+        # speech_rate / volume are ignored — mlx-audio doesn't expose them yet.
         return None
 
 
@@ -244,7 +247,9 @@ class DashscopeTts:
         # isn't blocked by the sync httpx call.
         return await mlx_call(_synth_dashscope_sync, text, voice)
 
-    def stream(self, *, voice: str | None = None):  # noqa: ARG002
+    def stream(self, *, voice: str | None = None,    # noqa: ARG002
+               speech_rate: float | None = None,
+               volume: float | None = None):
         # HTTP one-shot endpoint — no duplex, callers fall back to synth().
         return None
 
@@ -272,8 +277,15 @@ class DashscopeRealtimeTtsStream:
         before closing, so we don't truncate trailing audio.
     """
 
-    def __init__(self, voice: Optional[str] = None):
+    def __init__(self, voice: Optional[str] = None,
+                 speech_rate: Optional[float] = None,
+                 volume: Optional[float] = None):
         self._voice = voice
+        # Per-session prosody overrides — None means "use settings.tts default".
+        # Drives the session.update payload in open() below. Set by the WS
+        # handler in response to meta-command fast-path (慢点/快点/大声点/小声点).
+        self._speech_rate_override = speech_rate
+        self._volume_override = volume
         self._ws: Optional[_wspkg.WebSocketClientProtocol] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._opened = asyncio.Event()
@@ -323,9 +335,9 @@ class DashscopeRealtimeTtsStream:
             "language_type": ds.tts_lang,
             "response_format": t.response_format,
             "sample_rate": t.sr,
-            "speech_rate": t.speech_rate,
+            "speech_rate": self._speech_rate_override if self._speech_rate_override is not None else t.speech_rate,
             "pitch_rate": t.pitch_rate,
-            "volume": t.volume,
+            "volume": self._volume_override if self._volume_override is not None else t.volume,
         }
         if t.response_format == "opus":
             session_cfg["bit_rate"] = t.bit_rate
@@ -456,8 +468,12 @@ class DashscopeRealtimeTts:
     def model_id(self) -> str:
         return settings.dashscope.tts_model
 
-    def stream(self, *, voice: str | None = None) -> DashscopeRealtimeTtsStream:
-        return DashscopeRealtimeTtsStream(voice=voice)
+    def stream(self, *, voice: str | None = None,
+               speech_rate: float | None = None,
+               volume: float | None = None) -> DashscopeRealtimeTtsStream:
+        return DashscopeRealtimeTtsStream(
+            voice=voice, speech_rate=speech_rate, volume=volume,
+        )
 
     async def synth(self, text: str, *, voice: str | None = None) -> tuple[bytes, int, int]:
         import numpy as np  # noqa: PLC0415
