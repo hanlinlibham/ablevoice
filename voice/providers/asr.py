@@ -13,16 +13,39 @@ stream thread (see runtime.py for why).
 
 DashScope realtime path
 =======================
-``paraformer-realtime-v2`` over their inference WS. Protocol:
+``paraformer-realtime-v2`` (default) and ``qwen3-asr-flash-realtime``
+both share the same ``api-ws/v1/inference/`` endpoint + run-task /
+result-generated / finish-task event shape, so a single provider class
+serves both. The difference is HOW you bias for proper nouns:
+
+  - paraformer-realtime-v2 → ``parameters.vocabulary_id`` (managed cloud-
+    side via scripts/manage_vocabulary.py; see
+    DASHSCOPE_ASR_VOCABULARY_ID env)
+  - qwen3-asr-flash-realtime → ``input.context`` natural-language prompt
+    (e.g. "Technical terms: 宁德时代, 科创50, 贵州茅台"; see
+    DASHSCOPE_ASR_CONTEXT env)
+
+The provider passes whichever envs are set — paraformer ignores
+unknown ``input.context`` and qwen3 ignores unknown
+``parameters.vocabulary_id``, so leaving the unused one empty is safe.
+
+Protocol:
     1. connect with Authorization bearer <key>
     2. send JSON ``run-task`` (task_group=audio / task=asr / function=
-       recognition, model, sample_rate, format=pcm)
+       recognition, model, sample_rate, format=pcm, [vocabulary_id],
+       [context])
     3. wait for header.event == ``task-started``
     4. send binary PCM frames (int16 LE, mono)
     5. JSON ``result-generated`` events carry cumulative text on
        payload.output.sentence.text — forward each as a partial
+       (also runs a LocalAgreement-2 stabilizer to surface a stable_text
+       prefix the UI can render in normal weight)
     6. send ``finish-task`` → wait for ``task-finished`` → take last
        partial text as the final transcript
+
+To A/B test qwen3 vs paraformer:
+    DASHSCOPE_ASR_MODEL=qwen3-asr-flash-realtime ./start-tui.sh
+    DASHSCOPE_ASR_CONTEXT='Technical terms: 宁德时代, 科创50' ...
 """
 
 from __future__ import annotations
@@ -127,6 +150,55 @@ class MlxStreamingAsr:
 
 # --- DashScope realtime AsrSession ------------------------------------------
 
+def _build_run_task_payload(
+    *, model: str, sample_rate: int, lang: str,
+    task_id: str, vocabulary_id: str = "", context: str = "",
+) -> dict:
+    """Assemble the DashScope inference WS ``run-task`` frame. Pure /
+    no I/O so unit tests can pin the wire shape across both ASR model
+    routes (paraformer vs qwen3-asr-flash-realtime).
+
+    Hotword fields are conditional:
+      - non-empty ``vocabulary_id`` → ``parameters.vocabulary_id`` (paraformer)
+      - non-empty ``context``       → ``input.context`` (qwen3-asr)
+    Both can be set without harm; each model ignores the other's field.
+    """
+    params: dict = {
+        "sample_rate": sample_rate,
+        "format": "pcm",
+        "language_hints": [lang],
+    }
+    if vocabulary_id:
+        params["vocabulary_id"] = vocabulary_id
+    input_payload: dict = {}
+    if context:
+        input_payload["context"] = context
+    return {
+        "header": {"action": "run-task", "task_id": task_id, "streaming": "duplex"},
+        "payload": {
+            "task_group": "audio",
+            "task": "asr",
+            "function": "recognition",
+            "model": model,
+            "parameters": params,
+            "input": input_payload,
+        },
+    }
+
+
+def _common_prefix(a: str, b: str) -> str:
+    """Longest common prefix of two strings — used by the LocalAgreement-2
+    stabilizer in ``DashscopeRealtimeAsr``. Pure / no I/O, kept module-level
+    so unit tests can hit it directly without spinning up a session."""
+    if not a or not b:
+        return ""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return a[:i]
+
+
 class DashscopeRealtimeAsr:
     """Bridge from our /ws PCM stream to DashScope's paraformer-realtime
     WebSocket. Owns one upstream WS per recording."""
@@ -137,6 +209,13 @@ class DashscopeRealtimeAsr:
         self._ws = None
         self._task_id = uuid.uuid4().hex
         self._last_text = ""
+        # LocalAgreement-2 partial stabilization. ``_committed_text`` is
+        # the longest prefix that has appeared in two consecutive partials —
+        # safe to render in normal weight in the UI. The trailing portion of
+        # ``_last_text`` past ``_committed_text`` is "tentative" and should be
+        # rendered dimmed/grey so users don't get jarred by re-writes.
+        # Monotone: once a prefix is committed, it cannot retract.
+        self._committed_text = ""
         self._started = asyncio.Event()
         self._finished = asyncio.Event()
         self._reader_task: Optional[asyncio.Task] = None
@@ -166,21 +245,17 @@ class DashscopeRealtimeAsr:
             # almost-succeeded shouldn't poison the next one.
             self._started = asyncio.Event()
             self._finished = asyncio.Event()
-            await self._ws.send(json.dumps({
-                "header": {"action": "run-task", "task_id": self._task_id, "streaming": "duplex"},
-                "payload": {
-                    "task_group": "audio",
-                    "task": "asr",
-                    "function": "recognition",
-                    "model": settings.dashscope.asr_model,
-                    "parameters": {
-                        "sample_rate": self._sr,
-                        "format": "pcm",
-                        "language_hints": [settings.dashscope.asr_lang],
-                    },
-                    "input": {},
-                },
-            }))
+            # Hotword biasing — see _build_run_task_payload for the dual
+            # paraformer (vocabulary_id) vs qwen3-asr (context) routes.
+            payload = _build_run_task_payload(
+                model=settings.dashscope.asr_model,
+                sample_rate=self._sr,
+                lang=settings.dashscope.asr_lang,
+                task_id=self._task_id,
+                vocabulary_id=settings.dashscope.asr_vocabulary_id,
+                context=settings.dashscope.asr_context,
+            )
+            await self._ws.send(json.dumps(payload))
             self._reader_task = asyncio.create_task(self._reader(), name="ds-asr-reader")
             # Block briefly until upstream confirms task-started —
             # otherwise the first PCM frames would race the run-task
@@ -206,11 +281,18 @@ class DashscopeRealtimeAsr:
                     sentence = ((ev.get("payload") or {}).get("output") or {}).get("sentence") or {}
                     text = sentence.get("text") or ""
                     if text and text != self._last_text:
+                        # LocalAgreement-2: a prefix is "committed" once it
+                        # has appeared in two consecutive partials. We compute
+                        # agreement = lcp(prev_partial, cur_partial) and only
+                        # extend committed_text — never shrink (rewrites are
+                        # tentative, never undo a commit).
+                        prev = self._last_text
+                        agreement = _common_prefix(prev, text)
+                        if len(agreement) > len(self._committed_text):
+                            self._committed_text = agreement
                         self._last_text = text
                         try:
-                            # Cloud doesn't separate stable from current text
-                            # — pass empty so caller falls back to full text.
-                            await self._on_partial(text, "")
+                            await self._on_partial(text, self._committed_text)
                         except Exception:
                             logger.exception("on_partial callback raised")
                 elif event in ("task-finished", "task-failed"):

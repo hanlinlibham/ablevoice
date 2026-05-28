@@ -75,9 +75,11 @@ class DashscopeConfig:
     than glued to LlmConfig) avoids the cross-stage coupling smell."""
     api_key: str
     base_url: str          # OpenAI-compat /chat/completions base
-    asr_model: str         # "paraformer-realtime-v2" (WS) or "qwen3-asr-flash"
+    asr_model: str         # "paraformer-realtime-v2" (default) or "qwen3-asr-flash-realtime" (newer LLM-style ASR, supports natural-language hotword context)
     asr_lang: str          # "zh" — sent as language_hints[0]
     asr_ws_url: str
+    asr_vocabulary_id: str # paraformer custom hotword vocabulary id (empty = no biasing). Manage via scripts/manage_vocabulary.py. Ignored by qwen3-asr-flash-realtime.
+    asr_context: str       # qwen3-asr-flash-realtime "Technical terms: ..." prompt (empty = none). Ignored by paraformer-realtime-v2. Use one or the other based on asr_model.
     chat_model: str        # "qwen3.7-max"
     chat_thinking: bool    # leave off for voice (kills first-audio latency)
     tts_model: str         # realtime: "qwen3-tts-flash-realtime" / "qwen3-tts-instruct-flash-realtime"; http: "qwen3-tts-instruct-flash"
@@ -339,6 +341,8 @@ def _load() -> Settings:
                 "DASHSCOPE_ASR_WS_URL",
                 "wss://dashscope.aliyuncs.com/api-ws/v1/inference/",
             ),
+            asr_vocabulary_id=_env_str("DASHSCOPE_ASR_VOCABULARY_ID", ""),
+            asr_context=_env_str("DASHSCOPE_ASR_CONTEXT", ""),
             chat_model=_env_str("DASHSCOPE_MODEL", "qwen3.7-max"),
             chat_thinking=_env_bool("DASHSCOPE_THINKING", False),
             tts_model=_env_str("DASHSCOPE_TTS_MODEL", "qwen3-tts-flash-realtime"),
