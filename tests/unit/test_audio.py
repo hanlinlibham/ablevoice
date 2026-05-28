@@ -118,14 +118,15 @@ class TestStripTtsUnfriendly:
         ("巴黎圣日耳曼 (Paris Saint-Germain, PSG)",       "巴黎圣日耳曼"),
         # English short ticker after Chinese phrase
         ("苹果公司 AAPL 涨了",                            "苹果公司 涨了"),
-        # Dates: M/D and Y/M/D — slash or dash separator
-        ("决赛定于 5/31 举行",                            "决赛定于 5月31日 举行"),
-        ("活动是 2026/5/31 的事",                         "活动是 2026年5月31日 的事"),
-        ("11-30 截止",                                    "11月30日 截止"),
-        # Plain numbers must SURVIVE — only confident patterns strip
-        ("2026 年第一季度",                               "2026 年第一季度"),
-        ("营收增长 25%",                                  "营收增长 25%"),
-        ("第 (1) 项",                                     "第 (1) 项"),
+        # Dates: M/D and Y/M/D — slash or dash separator → 年月日 →
+        # then wetext rewrites the digits to Chinese ordinals.
+        ("决赛定于 5/31 举行",                            "决赛定于 五月三十一日 举行"),
+        ("活动是 2026/5/31 的事",                         "活动是 二零二六年五月三十一日 的事"),
+        ("11-30 截止",                                    "十一月三十日 截止"),
+        # Plain numbers get wetext-normalized to spoken form
+        ("2026 年第一季度",                               "两千零二十六 年第一季度"),
+        ("营收增长 25%",                                  "营收增长 百分之二十五"),
+        ("第 (1) 项",                                     "第 (一) 项"),
         # Structural symbols — bullets, range dashes, leftover slashes
         ("- 欧冠赛程 - 决赛",                             "欧冠赛程 决赛"),
         ("项 / 类",                                       "项 类"),
@@ -136,8 +137,13 @@ class TestStripTtsUnfriendly:
         # The user-reported end-to-end case — now no dash/slash artifacts
         (
             "参考来源:- [欧冠赛程 - 5/31决赛](https://tw.trip.com/blog/uefa-champions/)",
-            "参考来源: 欧冠赛程 5月31日决赛",
+            "参考来源: 欧冠赛程 五月三十一日决赛",
         ),
+        # wetext-driven normalization (the new pass added 2026-05)
+        ("涨幅 2.5%",                                    "涨幅 百分之二点五"),
+        ("市值 600 亿",                                   "市值 六百亿"),
+        ("总价 ¥1000",                                   "总价 一千元"),
+        ("0.5 摄氏度",                                    "零点五摄氏度"),
         ("",                                              ""),
     ])
     def test_golden(self, inp, out):

@@ -17,11 +17,14 @@ without touching this file.
 from __future__ import annotations
 
 import io
+import logging
 import re
 import wave
 from typing import Optional
 
 from .config import settings
+
+logger = logging.getLogger("voice.audio")
 
 
 # --- WAV packing + post-processing ------------------------------------------
@@ -182,6 +185,62 @@ def strip_markdown_inline(s: str) -> str:
     return s
 
 
+# --- Chinese number / unit / date normalization (wetext) -------------------
+#
+# wetext (pengzhendong/wetext) is a pure-Python runtime that re-uses
+# WeTextProcessing's compiled FAR rules without needing Pynini. Covers the
+# patterns TTS routinely mispronounces:
+#   "2.5%"      → "百分之二点五"
+#   "600 亿"    → "六百亿"
+#   "5-10月"    → "五到十月"
+#   "¥1000"     → "一千元"
+#   "0.5℃"      → "零点五摄氏度"
+# Lazy-import so audio.py stays importable on machines where wetext isn't
+# installed yet (graceful no-op fallback).
+
+_tn_zh_normalizer = None   # None=not tried, False=tried-and-failed, else Normalizer
+
+
+def _get_tn_zh():
+    global _tn_zh_normalizer
+    if _tn_zh_normalizer is None:
+        try:
+            from wetext import Normalizer  # noqa: PLC0415 — heavy on first call
+            _tn_zh_normalizer = Normalizer(lang="zh", operator="tn")
+        except ImportError:
+            logger.warning(
+                "wetext not installed — TTS number/unit normalization disabled. "
+                "Install with: pip install wetext"
+            )
+            _tn_zh_normalizer = False
+        except Exception:
+            logger.exception("wetext Normalizer init failed — normalization disabled")
+            _tn_zh_normalizer = False
+    return _tn_zh_normalizer or None
+
+
+def normalize_zh_for_tts(s: str) -> str:
+    """Normalize Chinese text to spoken form for TTS.
+
+    Wraps wetext (WeTextProcessing FAR runtime). Covers numbers,
+    percentages, currencies, units, dates, ranges, fractions. Runs
+    BEFORE the regex-based structural strip so the spoken text is
+    what gets cleaned of leftover symbols.
+
+    Returns ``s`` unchanged when wetext isn't installed or fails.
+    """
+    if not s:
+        return s
+    tn = _get_tn_zh()
+    if tn is None:
+        return s
+    try:
+        return tn.normalize(s)
+    except Exception:
+        logger.exception("wetext normalize failed for %r — using raw", s[:60])
+        return s
+
+
 # --- TTS speakability cleanup ----------------------------------------------
 #
 # LLMs (especially the ablework agent which doesn't honour our
@@ -259,9 +318,16 @@ def strip_tts_unfriendly(s: str) -> str:
       9. Structural ``-`` / ``—`` / ``/`` between non-word chars → drop
      10. Whitespace cleanup (collapse runs, trim before punct)
 
-    Plain numbers (``2026 年``, ``25%``, bullet ``(1)``), Chinese
-    sentence punct, and word-internal hyphens (``Microsoft-Word``)
-    survive.
+    Word-internal hyphens (``Microsoft-Word``) and bullet ``(1)``
+    survive. Plain numbers / percentages / currencies / units are
+    rewritten to spoken form by the final wetext pass.
+
+    Pass 11: ``normalize_zh_for_tts`` — wetext rewrites numbers /
+    percentages / currencies / dates / units to their spoken form
+    ("2.5%" → "百分之二点五", "¥1000" → "一千元"). Runs LAST so the
+    structural strips (esp. ``_TICKER_WITH_SUFFIX``) see raw ASCII
+    digits first — putting wetext earlier turns "600519" into
+    "六零零五幺九" and the ticker regex no longer matches.
     """
     s = _MD_LINK_RE.sub(r"\1", s)
     s = _URL_RE.sub("", s)
@@ -274,6 +340,7 @@ def strip_tts_unfriendly(s: str) -> str:
     s = _MD_REMNANT_RE.sub("", s)
     s = _STRUCTURAL_DASH_RE.sub("", s)
     s = _STRUCTURAL_SLASH_RE.sub("", s)
+    s = normalize_zh_for_tts(s)
     s = _MULTI_SPACE_RE.sub(" ", s)
     s = _SPACE_BEFORE_PUNCT_RE.sub("", s)
     return s.strip()
