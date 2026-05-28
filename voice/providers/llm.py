@@ -43,7 +43,7 @@ import httpx
 
 from ..audio import strip_markdown_inline
 from ..config import settings
-from ..runtime import mlx_call
+from ..runtime import http, mlx_call
 
 logger = logging.getLogger("voice.providers.llm")
 
@@ -145,31 +145,31 @@ class DashscopeLlm:
             "max_tokens": 1024,
             "enable_thinking": settings.dashscope.chat_thinking,
         }
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream(
-                "POST", f"{settings.dashscope.base_url}/chat/completions",
-                headers=headers, json=body,
-            ) as r:
-                if r.status_code != 200:
-                    detail = (await r.aread())[:300].decode("utf-8", "replace")
-                    raise RuntimeError(f"dashscope HTTP {r.status_code}: {detail}")
-                async for line in r.aiter_lines():
-                    line = line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                    choices = event.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = (choices[0].get("delta") or {}).get("content") or ""
-                    if delta:
-                        yield delta
+        client = http(verify=True)
+        async with client.stream(
+            "POST", f"{settings.dashscope.base_url}/chat/completions",
+            headers=headers, json=body, timeout=60.0,
+        ) as r:
+            if r.status_code != 200:
+                detail = (await r.aread())[:300].decode("utf-8", "replace")
+                raise RuntimeError(f"dashscope HTTP {r.status_code}: {detail}")
+            async for line in r.aiter_lines():
+                line = line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                delta = (choices[0].get("delta") or {}).get("content") or ""
+                if delta:
+                    yield delta
 
 
 # --- Ablework (AI SDK v6 UIMessage SSE) -------------------------------------
@@ -218,40 +218,38 @@ class AbleworkLlm:
             "Content-Type": "application/json",
         }
         # Cert verify off by default — see config.py comment.
-        async with httpx.AsyncClient(
-            timeout=60.0, verify=settings.ablework.verify_ssl,
-        ) as client:
-            async with client.stream(
-                "POST", settings.ablework.url, headers=headers, json=body,
-            ) as r:
-                if r.status_code != 200:
-                    detail = (await r.aread())[:300].decode("utf-8", "replace")
-                    raise RuntimeError(f"ablework HTTP {r.status_code}: {detail}")
-                async for line in r.aiter_lines():
-                    line = line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                    t = event.get("type")
-                    if t == "text-delta":
-                        delta = event.get("delta") or ""
-                        # Strip markdown so TTS doesn't read out ``*``,
-                        # ``|`` etc. ablework backend emits raw markdown
-                        # (the others tend to follow our system prompt
-                        # and stay clean, so we don't strip them).
-                        delta = strip_markdown_inline(delta)
-                        if delta:
-                            yield delta
-                    elif t == "finish":
-                        break
-                    # Everything else (data-event, reasoning-*, data-usage,
-                    # tool-input-*, etc.) silently dropped.
+        client = http(verify=settings.ablework.verify_ssl)
+        async with client.stream(
+            "POST", settings.ablework.url, headers=headers, json=body, timeout=60.0,
+        ) as r:
+            if r.status_code != 200:
+                detail = (await r.aread())[:300].decode("utf-8", "replace")
+                raise RuntimeError(f"ablework HTTP {r.status_code}: {detail}")
+            async for line in r.aiter_lines():
+                line = line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                t = event.get("type")
+                if t == "text-delta":
+                    delta = event.get("delta") or ""
+                    # Strip markdown so TTS doesn't read out ``*``,
+                    # ``|`` etc. ablework backend emits raw markdown
+                    # (the others tend to follow our system prompt
+                    # and stay clean, so we don't strip them).
+                    delta = strip_markdown_inline(delta)
+                    if delta:
+                        yield delta
+                elif t == "finish":
+                    break
+                # Everything else (data-event, reasoning-*, data-usage,
+                # tool-input-*, etc.) silently dropped.
 
 
 # --- Ollama -----------------------------------------------------------------
@@ -265,32 +263,33 @@ class OllamaLlm:
         self, messages: list[dict], session_id: str,
         *, workspace_id: str | None = None,   # noqa: ARG002 — ollama has no workspace
     ) -> AsyncIterator[str]:
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream(
-                "POST",
-                f"{settings.ollama.url}/api/chat",
-                json={
-                    "model": settings.ollama.model,
-                    "messages": messages,
-                    "stream": True,
-                    "think": settings.ollama.think,
-                },
-            ) as r:
-                if r.status_code != 200:
-                    body = await r.aread()
-                    raise RuntimeError(
-                        f"ollama HTTP {r.status_code}: {body[:200].decode('utf-8','replace')}"
-                    )
-                async for line in r.aiter_lines():
-                    if not line.strip():
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    msg = event.get("message", {}) or {}
-                    delta = msg.get("content", "") or ""
-                    if delta:
-                        yield delta
-                    if event.get("done"):
-                        break
+        client = http(verify=True)   # localhost — verify flag doesn't matter
+        async with client.stream(
+            "POST",
+            f"{settings.ollama.url}/api/chat",
+            json={
+                "model": settings.ollama.model,
+                "messages": messages,
+                "stream": True,
+                "think": settings.ollama.think,
+            },
+            timeout=None,
+        ) as r:
+            if r.status_code != 200:
+                body = await r.aread()
+                raise RuntimeError(
+                    f"ollama HTTP {r.status_code}: {body[:200].decode('utf-8','replace')}"
+                )
+            async for line in r.aiter_lines():
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = event.get("message", {}) or {}
+                delta = msg.get("content", "") or ""
+                if delta:
+                    yield delta
+                if event.get("done"):
+                    break
