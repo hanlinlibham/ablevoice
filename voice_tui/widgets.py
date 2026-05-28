@@ -327,22 +327,49 @@ class MicMeter(Static):
     visible = reactive(False)
     t_started = reactive(0.0)              # set when recording begins
 
+    _VOICE_THRESHOLD = 0.025
+    _HOT_THRESHOLD = 0.12
+
     def on_mount(self) -> None:
-        # 1 Hz tick for the duration counter. Only refreshes while
-        # visible — idle cost is one comparison per second.
-        self.set_interval(1.0, self._tick)
+        # 12 fps while recording: enough for an obvious live waveform
+        # without making the terminal redraw noisy. Idle cost is one
+        # cheap visibility check per tick.
+        self.set_interval(1 / 12, self._tick)
 
     def _tick(self) -> None:
         if self.visible:
             self.refresh()
 
+    def _wave(self, width: int = 18) -> str:
+        """Small animated mono waveform driven by current RMS.
+
+        The input callback gives us level, not raw samples in the widget,
+        so this intentionally renders a level-responsive synthetic wave.
+        It is a confidence cue ("the mic is receiving input") rather
+        than a waveform analyzer."""
+        if self.level < self._VOICE_THRESHOLD:
+            return "·" * width
+        glyphs = "▁▂▃▄▅▆▇█"
+        amp = min(1.0, max(0.0, self.level / self._HOT_THRESHOLD))
+        phase = int(time.monotonic() * 18)
+        chars = []
+        for i in range(width):
+            # Triangle-ish repeating wave, shifted over time.
+            x = (i + phase) % 8
+            tri = x if x < 4 else 7 - x
+            idx = int(1 + tri * amp * 2)
+            chars.append(glyphs[min(idx, len(glyphs) - 1)])
+        return "".join(chars)
+
     def render(self):
         if not self.visible:
             return Text("")
-        bar_width = 40
+        width = getattr(getattr(self, "size", None), "width", 100) or 100
+        bar_width = max(12, min(32, width - 64))
         filled = int(min(1.0, self.level * 3.0) * bar_width)
         bar = "█" * filled + "░" * (bar_width - filled)
-        if self.level < 0.02:
+        speaking = self.level >= self._VOICE_THRESHOLD
+        if not speaking:
             colour = "red"
         elif self.level < 0.08:
             colour = "yellow"
@@ -354,11 +381,17 @@ class MicMeter(Static):
             dur = int(time.monotonic() - self.t_started)
             mm, ss = divmod(dur, 60)
             t.append(f"  {mm:02d}:{ss:02d}", style="bold yellow")
-            t.append("  mic ", style="dim")
+            t.append("  音量检测中 ", style="dim")
         else:
-            t.append("  mic ", style="dim")
+            t.append("  音量检测中 ", style="dim")
         t.append(bar, style=colour)
+        t.append("  ")
+        if speaking:
+            t.append(self._wave(), style="bold green")
+            t.append("  正在输入", style="bold green")
+        else:
+            t.append(self._wave(), style="dim red")
         t.append(f"  {self.level*100:5.1f}%  peak {self.peak*100:4.0f}%", style="dim")
-        if self.level < 0.02:
+        if not speaking:
             t.append("  ← 没采到声音", style="bold red")
         return t
