@@ -410,7 +410,7 @@ def _load() -> Settings:
         ),
         polish=PolishConfig(
             enabled=_env_bool("POLISH_ENABLED", True),
-            provider=_env_str("POLISH_PROVIDER", "mlx").lower(),
+            provider=_env_str("POLISH_PROVIDER", "dashscope").lower(),
             use_polished_for_chat=_env_bool("POLISH_USE_FOR_CHAT", True),
             max_tokens=_env_int("POLISH_MAX_TOKENS", 256),
             temperature=_env_float("POLISH_TEMPERATURE", 0.2),
