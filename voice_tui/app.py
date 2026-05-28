@@ -32,7 +32,7 @@ import numpy as np
 import sounddevice as sd
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Footer, Header, Input
 
 from .audio import AudioStreamer
@@ -61,9 +61,11 @@ class VoiceTUI(App):
     StatusBar    { dock: top; height: 1; padding: 0 1; background: $boost; }
     WorkspaceBar { dock: top; height: 1; padding: 0 1; background: $panel; }
     Conversation { padding: 1 2; }
-    Input#composer { dock: bottom; height: 3; margin: 0 1; border: round $primary-darken-2; }
+    #body        { height: 1fr; }
+    #bottombar   { height: auto; }
+    Input#composer { height: 3; margin: 0 1; border: round $primary-darken-2; }
     Input#composer:focus { border: round $primary; }
-    MicMeter     { dock: bottom; height: 1; padding: 0 1; }
+    MicMeter     { height: 1; padding: 0 1; }
     Footer       { background: $boost; }
     """
     BINDINGS = [
@@ -78,6 +80,7 @@ class VoiceTUI(App):
         Binding("W",     "refresh_workspaces",    "Refresh ws list"),
         Binding("t",     "focus_composer",        "Type (t)"),
         Binding("escape", "blur_composer",        "语音模式", show=False),
+        Binding("m",     "cycle_preset",          "Preset (m)"),
         Binding("q",     "quit",      "Quit"),
     ]
 
@@ -104,6 +107,9 @@ class VoiceTUI(App):
         self._ws_list: list[dict] = []
         self._ws_current_id: str | None = None
         self._ws_current_name: str = ""
+        # Provider preset switching (from ready/preset_changed events).
+        self._presets: list[dict] = []
+        self._preset: str | None = None
 
     # ── layout ────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
@@ -112,15 +118,16 @@ class VoiceTUI(App):
         yield WorkspaceBar(id="ws")
         with VerticalScroll(id="body"):
             yield Conversation(id="conv")
-        yield Input(id="composer", placeholder="t 打字对话 · Enter 发送 · Esc 切回语音(Space 录音)")
-        yield MicMeter(id="mic")
+        with Vertical(id="bottombar"):
+            yield Input(id="composer", placeholder="t 打字对话 · Enter 发送 · Esc 切回语音(Space 录音)")
+            yield MicMeter(id="mic")
         yield Footer()
 
     # ── lifecycle ─────────────────────────────────────────────────────
     async def on_mount(self) -> None:
         conv = self.query_one("#conv", Conversation)
         conv.append_system(
-            "Space 录音 · t 打字 · i 打断 · r 重置 · R 恢复 · v/V 换声 · p polish · q 退出"
+            "Space 录音 · t 打字 · i 打断 · r 重置 · R 恢复 · v/V 换声 · p polish · m 预设 · q 退出"
         )
         # Mic device intro — same diagnostic as before. Helps users
         # spot virtual routing devices that PortAudio sometimes picks
@@ -178,6 +185,7 @@ class VoiceTUI(App):
                 "intent_ack":          self._h_intent_ack,
                 "voice_set":           self._h_noop,
                 "polish_set":          self._h_noop,
+                "preset_changed":      self._h_preset_changed,
             },
             on_status=self._on_ws_status,
             on_drafts_available=self._on_drafts_available,
@@ -242,23 +250,9 @@ class VoiceTUI(App):
                 self.audio.close()
             self.tts_sr = new_sr
             self.audio = AudioStreamer(self.tts_sr)
-        asr_provider = ev.get("asr_provider", "?")
-        llm_provider = ev.get("llm_provider", "?")
+        self._apply_providers(ev)
         tts_provider = ev.get("tts_provider", "?")
         tts_voice    = ev.get("tts_voice")  or "?"
-
-        def _tag(label: str, provider: str) -> str:
-            if provider in ("dashscope",):
-                tag = "cloud"
-            elif provider in ("ablework", "ollama"):
-                tag = provider
-            else:
-                tag = "local"
-            return label if tag.lower() == label.lower() else f"{label} ({tag})"
-
-        status.asr_info = _tag(self._short(ev.get("asr_model_id", "?")), asr_provider)
-        status.llm_info = _tag(self._short(ev.get("llm_model_id", "?")), llm_provider)
-        status.tts_info = _tag(tts_voice, tts_provider)
         # Initialise voice cycle index to whatever server is using.
         try:
             if tts_provider == "mlx" and tts_voice in MLX_VOICE_CYCLE:
@@ -270,6 +264,35 @@ class VoiceTUI(App):
         self._sys(
             f"server ready: ASR={status.asr_info} · "
             f"LLM={status.llm_info} · TTS={status.tts_info} @ {self.tts_sr}Hz"
+            + (f" · 预设={self._preset}" if self._preset else "")
+        )
+
+    def _apply_providers(self, ev: dict) -> None:
+        """Update the status bar's provider tags + cache the preset list.
+        Shared by ready and preset_changed."""
+        status = self.query_one("#status", StatusBar)
+
+        def _tag(label: str, provider: str) -> str:
+            if provider in ("dashscope",):
+                tag = "cloud"
+            elif provider in ("ablework", "ollama"):
+                tag = provider
+            else:
+                tag = "local"
+            return label if tag.lower() == label.lower() else f"{label} ({tag})"
+
+        status.asr_info = _tag(self._short(ev.get("asr_model_id", "?")), ev.get("asr_provider", "?"))
+        status.llm_info = _tag(self._short(ev.get("llm_model_id", "?")), ev.get("llm_provider", "?"))
+        status.tts_info = _tag(ev.get("tts_voice") or "?", ev.get("tts_provider", "?"))
+        if ev.get("presets"):
+            self._presets = ev["presets"]
+        self._preset = ev.get("preset")
+
+    async def _h_preset_changed(self, ev: dict) -> None:
+        self._apply_providers(ev)
+        self._sys(
+            f"[cyan]已切换预设 → {self._preset}[/cyan]  "
+            f"ASR={ev.get('asr_provider')} · LLM={ev.get('llm_provider')} · TTS={ev.get('tts_provider')}"
         )
 
     async def _h_asr_partial(self, ev: dict) -> None:
@@ -530,13 +553,19 @@ class VoiceTUI(App):
             status = self.query_one("#status", StatusBar)
         except Exception:
             return
+        mic = self.query_one("#mic", MicMeter)
         while True:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.06)   # ~16fps — smooth playback meter
             if self.audio is None:
                 continue
             new = self.audio.busy
             if new != status.playing:
                 status.playing = new
+            # Drive the playback waveform — but only when NOT recording
+            # (recording owns the meter + feeds the real mic level).
+            if not status.recording:
+                mic.playing = new
+                mic.play_level = self.audio.level if new else 0.0
 
     # ── actions (hotkeys) ────────────────────────────────────────────
 
@@ -725,6 +754,20 @@ class VoiceTUI(App):
     def action_toggle_polish(self) -> None:
         self._polish_enabled = not self._polish_enabled
         asyncio.create_task(self._set_polish(self._polish_enabled))
+
+    def action_cycle_preset(self) -> None:
+        """Cycle to the next provider preset (m). Server applies it
+        globally; preset_changed updates the status bar."""
+        if self.ws_client is None or not self._presets:
+            self._sys("[yellow]还没收到预设列表(等 server ready)[/yellow]")
+            return
+        names = [p["name"] for p in self._presets]
+        try:
+            idx = names.index(self._preset) if self._preset in names else -1
+        except ValueError:
+            idx = -1
+        nxt = names[(idx + 1) % len(names)]
+        asyncio.create_task(self.ws_client.send_json({"type": "set_preset", "preset": nxt}))
 
     async def _set_polish(self, enabled: bool) -> None:
         if self.ws_client is None:

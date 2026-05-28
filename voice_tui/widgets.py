@@ -317,40 +317,44 @@ class Conversation(Static):
 
 
 class MicMeter(Static):
-    """Live mic level bar — visible only while recording.
+    """Live level bar for the bottom bar — doubles as a recording meter
+    (mic input, while recording) and a playback meter (TTS output, while
+    the assistant is speaking).
 
-    Also shows recording duration (``00:23 recording``) so a long-form
-    capture (the 1-5min scenarios) gives the user a clock instead of
-    "is this thing on?" anxiety."""
-    level = reactive(0.0)
+    Recording also shows duration (``00:23``) so a long-form capture (the
+    1-5min scenarios) gives the user a clock instead of "is this thing
+    on?" anxiety. Playback shows a cyan waveform riding the TTS envelope."""
+    level = reactive(0.0)                  # mic input level (recording)
     peak = reactive(0.0)
-    visible = reactive(False)
+    visible = reactive(False)              # True while recording
     t_started = reactive(0.0)              # set when recording begins
+    playing = reactive(False)              # True while TTS is playing
+    play_level = reactive(0.0)             # TTS output level (playback)
 
     _VOICE_THRESHOLD = 0.025
     _HOT_THRESHOLD = 0.12
 
     def on_mount(self) -> None:
-        # 12 fps while recording: enough for an obvious live waveform
-        # without making the terminal redraw noisy. Idle cost is one
-        # cheap visibility check per tick.
+        # 12 fps while active: enough for an obvious live waveform without
+        # making the terminal redraw noisy. Idle cost is one cheap
+        # visibility check per tick.
         self.set_interval(1 / 12, self._tick)
 
     def _tick(self) -> None:
-        if self.visible:
+        if self.visible or self.playing:
             self.refresh()
 
-    def _wave(self, width: int = 18) -> str:
-        """Small animated mono waveform driven by current RMS.
+    def _wave(self, level: float, width: int = 18) -> str:
+        """Small animated mono waveform driven by ``level`` (RMS).
 
-        The input callback gives us level, not raw samples in the widget,
-        so this intentionally renders a level-responsive synthetic wave.
-        It is a confidence cue ("the mic is receiving input") rather
-        than a waveform analyzer."""
-        if self.level < self._VOICE_THRESHOLD:
+        Callbacks give us a level, not raw samples, so this renders a
+        level-responsive synthetic wave — a confidence cue ("audio is
+        flowing") rather than a real waveform analyzer. Shared by the
+        recording (mic) and playback (TTS) meters."""
+        if level < self._VOICE_THRESHOLD:
             return "·" * width
         glyphs = "▁▂▃▄▅▆▇█"
-        amp = min(1.0, max(0.0, self.level / self._HOT_THRESHOLD))
+        amp = min(1.0, max(0.0, level / self._HOT_THRESHOLD))
         phase = int(time.monotonic() * 18)
         chars = []
         for i in range(width):
@@ -361,11 +365,19 @@ class MicMeter(Static):
             chars.append(glyphs[min(idx, len(glyphs) - 1)])
         return "".join(chars)
 
-    def render(self):
-        if not self.visible:
-            return Text("")
+    def _bar_width(self) -> int:
         width = getattr(getattr(self, "size", None), "width", 100) or 100
-        bar_width = max(12, min(32, width - 64))
+        return max(12, min(32, width - 64))
+
+    def render(self):
+        if self.visible:
+            return self._render_recording()
+        if self.playing:
+            return self._render_playback()
+        return Text("")
+
+    def _render_recording(self):
+        bar_width = self._bar_width()
         filled = int(min(1.0, self.level * 3.0) * bar_width)
         bar = "█" * filled + "░" * (bar_width - filled)
         speaking = self.level >= self._VOICE_THRESHOLD
@@ -387,11 +399,24 @@ class MicMeter(Static):
         t.append(bar, style=colour)
         t.append("  ")
         if speaking:
-            t.append(self._wave(), style="bold green")
+            t.append(self._wave(self.level), style="bold green")
             t.append("  正在输入", style="bold green")
         else:
-            t.append(self._wave(), style="dim red")
+            t.append(self._wave(self.level), style="dim red")
         t.append(f"  {self.level*100:5.1f}%  peak {self.peak*100:4.0f}%", style="dim")
         if not speaking:
             t.append("  ← 没采到声音", style="bold red")
+        return t
+
+    def _render_playback(self):
+        bar_width = self._bar_width()
+        lvl = self.play_level
+        filled = int(min(1.0, lvl * 3.0) * bar_width)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        t = Text()
+        t.append("  🔊 播放中 ", style="bold cyan")
+        t.append(bar, style="cyan")
+        t.append("  ")
+        t.append(self._wave(lvl), style="bold cyan")
+        t.append(f"  {lvl*100:5.1f}%", style="dim")
         return t

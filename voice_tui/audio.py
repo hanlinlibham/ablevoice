@@ -29,6 +29,10 @@ class AudioStreamer:
         self._cur: np.ndarray | None = None
         self._cur_pos = 0
         self._lock = threading.Lock()
+        # Running output level (RMS of the last played block), read by the
+        # UI to draw a playback waveform. Plain float — single-writer
+        # (audio thread) / single-reader (UI), atomic enough for a meter.
+        self._level = 0.0
         self._stream = sd.OutputStream(
             samplerate=sample_rate, channels=1, dtype="float32",
             blocksize=512, callback=self._callback,
@@ -53,6 +57,16 @@ class AudioStreamer:
                 written += take
                 if self._cur_pos >= self._cur.shape[0]:
                     self._cur = None
+        # RMS of what we actually played this block, smoothed (fast attack,
+        # slow release) so the meter rides the speech envelope instead of
+        # strobing at block rate.
+        rms = float(np.sqrt(np.mean(np.square(out[:written])))) if written else 0.0
+        self._level = rms if rms > self._level else self._level * 0.8 + rms * 0.2
+
+    @property
+    def level(self) -> float:
+        """Smoothed RMS of the audio currently playing (0..~1)."""
+        return self._level
 
     def enqueue(self, samples: np.ndarray) -> None:
         with self._lock:

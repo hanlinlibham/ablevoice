@@ -10,6 +10,11 @@ import {
   RefreshCw,
   StopCircle,
 } from "lucide-react";
+import {
+  NeuralVoiceField,
+  type NeuralSemanticSignal,
+  type NeuralVoiceApiState,
+} from "./components/NeuralVoiceField";
 
 /* --------------------------------------------------------------------------
  * ai-elements-style minimal components.
@@ -21,6 +26,10 @@ import {
  * ------------------------------------------------------------------------ */
 
 type Role = "user" | "assistant" | "system";
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 function Message({ role, children, footer, polishChanged }: {
   role: Role;
@@ -119,16 +128,13 @@ function ModeChip({
 function RecordingMeter({ level, peak, startedAt }: {
   level: number; peak: number; startedAt: number | null;
 }) {
-  const [tick, setTick] = useState(0);
+  const [elapsedMs, setElapsedMs] = useState(0);
   useEffect(() => {
     if (!startedAt) return;
-    const t = setInterval(() => setTick((n) => n + 1), 250);
+    const t = setInterval(() => setElapsedMs(Date.now() - startedAt), 250);
     return () => clearInterval(t);
   }, [startedAt]);
-  // tick is unused by purpose — its re-render is what updates the
-  // displayed mm:ss. Reference it so eslint doesn't flag unused.
-  void tick;
-  const dur = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
+  const dur = startedAt ? Math.floor(elapsedMs / 1000) : 0;
   const mm = String(Math.floor(dur / 60)).padStart(2, "0");
   const ss = String(dur % 60).padStart(2, "0");
   const width = Math.min(100, level * 300);
@@ -235,7 +241,7 @@ function useAudioQueue() {
   const currentRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState(false);
 
-  const playNext = useCallback(() => {
+  const playNext = useCallback(function playNextInner() {
     const item = queueRef.current.shift();
     if (!item) {
       setPlaying(false);
@@ -247,18 +253,18 @@ function useAudioQueue() {
     audio.onended = () => {
       URL.revokeObjectURL(item.url);
       currentRef.current = null;
-      playNext();
+      playNextInner();
     };
     audio.onerror = () => {
       URL.revokeObjectURL(item.url);
       currentRef.current = null;
-      playNext();
+      playNextInner();
     };
     setPlaying(true);
     void audio.play().catch(() => {
       URL.revokeObjectURL(item.url);
       currentRef.current = null;
-      playNext();
+      playNextInner();
     });
   }, []);
 
@@ -314,8 +320,17 @@ type Workspace = {
   last_active_at?: string;
 };
 
+type Preset = { name: string; label: string };
+type ConfigSnapshot = {
+  asr_provider: string; asr_model_id: string;
+  tts_provider: string; tts_model_id: string; tts_voice: string;
+  llm_provider: string; llm_model_id: string; tts_sr: number;
+  preset: string | null; presets: Preset[];
+};
+
 type WSHandlers = {
-  onReady?: (info: { asr_model_id: string; tts_model_id: string; llm_model_id: string }) => void;
+  onReady?: (info: ConfigSnapshot) => void;
+  onPresetChanged?: (info: ConfigSnapshot) => void;
   onAsrPartial?: (t: { text: string; stable_text: string }) => void;
   onTranscript?: (t: {
     id: string; text: string; ms: number; audio_bytes: number; peak_level: number | null;
@@ -356,6 +371,8 @@ type WSHandlers = {
   onPolishSet?: (p: { enabled: boolean }) => void;
 };
 
+type HandlerArg<K extends keyof WSHandlers> = Parameters<NonNullable<WSHandlers[K]>>[0];
+
 type VoiceWS = {
   connected: boolean;
   recording: boolean;
@@ -379,7 +396,9 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
 
   // Latest handlers, accessed by message handler without re-creating the WS.
   const handlersRef = useRef(handlers);
-  handlersRef.current = handlers;
+  useEffect(() => {
+    handlersRef.current = handlers;
+  }, [handlers]);
 
   const wsRef = useRef<WebSocket | null>(null);
   // Audio graph held across record cycles only — torn down on stop so the
@@ -414,35 +433,50 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
     };
     ws.onmessage = (ev) => {
       if (typeof ev.data !== "string") return;
-      let msg: any;
-      try { msg = JSON.parse(ev.data); }
-      catch { return; }
+      let msg: Record<string, unknown>;
+      try {
+        const parsed: unknown = JSON.parse(ev.data);
+        if (!parsed || typeof parsed !== "object") return;
+        msg = parsed as Record<string, unknown>;
+      } catch {
+        return;
+      }
       const h = handlersRef.current;
       switch (msg.type) {
-        case "ready":         h.onReady?.(msg); break;
-        case "asr_partial":   h.onAsrPartial?.(msg); break;
-        case "transcript":    h.onTranscript?.(msg); break;
-        case "meta":          h.onMeta?.(msg); break;
-        case "token":         h.onAssistantToken?.(msg.delta); break;
-        case "audio_chunk":   h.onAudioChunk?.(msg.b64, msg.text, msg.idx, msg.dur_ms, msg.synth_ms); break;
-        case "chat_done":     h.onChatDone?.(msg); break;
-        case "interrupted":   h.onInterrupted?.(msg.reason || "?"); break;
-        case "tts_done":      h.onTtsDone?.(msg); break;
-        case "history_reset": h.onHistoryReset?.(msg.cleared ?? 0); break;
-        case "error":         h.onError?.(msg.where || "?", msg.message || "?"); break;
-        case "transcript_polished": h.onTranscriptPolished?.(msg); break;
-        case "polish":        h.onPolish?.(msg); break;
-        case "retry":         h.onRetry?.(msg); break;
-        case "workspace_list": h.onWorkspaceList?.(msg); break;
-        case "workspace_changed": h.onWorkspaceChanged?.(msg); break;
-        case "intent_ack":    h.onIntentAck?.(msg); break;
-        case "voice_set":     h.onVoiceSet?.(msg); break;
-        case "polish_set":    h.onPolishSet?.(msg); break;
+        case "ready":         h.onReady?.(msg as HandlerArg<"onReady">); break;
+        case "preset_changed": h.onPresetChanged?.(msg as HandlerArg<"onPresetChanged">); break;
+        case "asr_partial":   h.onAsrPartial?.(msg as HandlerArg<"onAsrPartial">); break;
+        case "transcript":    h.onTranscript?.(msg as HandlerArg<"onTranscript">); break;
+        case "meta":          h.onMeta?.(msg as HandlerArg<"onMeta">); break;
+        case "token":         h.onAssistantToken?.(typeof msg.delta === "string" ? msg.delta : ""); break;
+        case "audio_chunk":   h.onAudioChunk?.(
+          typeof msg.b64 === "string" ? msg.b64 : "",
+          typeof msg.text === "string" ? msg.text : "",
+          typeof msg.idx === "number" ? msg.idx : 0,
+          typeof msg.dur_ms === "number" ? msg.dur_ms : 0,
+          typeof msg.synth_ms === "number" ? msg.synth_ms : 0,
+        ); break;
+        case "chat_done":     h.onChatDone?.(msg as HandlerArg<"onChatDone">); break;
+        case "interrupted":   h.onInterrupted?.(typeof msg.reason === "string" ? msg.reason : "?"); break;
+        case "tts_done":      h.onTtsDone?.(msg as HandlerArg<"onTtsDone">); break;
+        case "history_reset": h.onHistoryReset?.(typeof msg.cleared === "number" ? msg.cleared : 0); break;
+        case "error":         h.onError?.(
+          typeof msg.where === "string" ? msg.where : "?",
+          typeof msg.message === "string" ? msg.message : "?",
+        ); break;
+        case "transcript_polished": h.onTranscriptPolished?.(msg as HandlerArg<"onTranscriptPolished">); break;
+        case "polish":        h.onPolish?.(msg as HandlerArg<"onPolish">); break;
+        case "retry":         h.onRetry?.(msg as HandlerArg<"onRetry">); break;
+        case "workspace_list": h.onWorkspaceList?.(msg as HandlerArg<"onWorkspaceList">); break;
+        case "workspace_changed": h.onWorkspaceChanged?.(msg as HandlerArg<"onWorkspaceChanged">); break;
+        case "intent_ack":    h.onIntentAck?.(msg as HandlerArg<"onIntentAck">); break;
+        case "voice_set":     h.onVoiceSet?.(msg as HandlerArg<"onVoiceSet">); break;
+        case "polish_set":    h.onPolishSet?.(msg as HandlerArg<"onPolishSet">); break;
         default: console.warn("unknown ws event", msg);
       }
     };
     return () => {
-      try { ws.close(); } catch {}
+      try { ws.close(); } catch { /* already closed */ }
     };
   }, [sessionId]);
 
@@ -490,20 +524,27 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch (err: any) {
-      handlersRef.current.onError?.("mic", `getUserMedia failed: ${err?.message || err}`);
+    } catch (err: unknown) {
+      handlersRef.current.onError?.("mic", `getUserMedia failed: ${errorMessage(err)}`);
       return;
     }
     streamRef.current = stream;
 
     // Don't pin AudioContext to 16kHz — Safari ignores it; we resample
     // in the worklet using the actual sampleRate.
-    const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const AudioContextCtor = window.AudioContext ?? (window as Window & {
+      webkitAudioContext?: typeof AudioContext;
+    }).webkitAudioContext;
+    if (!AudioContextCtor) {
+      handlersRef.current.onError?.("mic", "AudioContext unavailable");
+      return;
+    }
+    const audioCtx = new AudioContextCtor();
     audioCtxRef.current = audioCtx;
     try {
       await audioCtx.audioWorklet.addModule("/pcm-worklet.js");
-    } catch (err: any) {
-      handlersRef.current.onError?.("worklet", `addModule failed: ${err?.message || err}`);
+    } catch (err: unknown) {
+      handlersRef.current.onError?.("worklet", `addModule failed: ${errorMessage(err)}`);
       stopRecording();
       return;
     }
@@ -610,6 +651,9 @@ export default function App() {
     tts_model_id: string;
     llm_model_id: string;
   } | null>(null);
+  // ── provider preset switching (driven by ready/preset_changed) ──
+  const [presets, setPresets] = useState<Preset[]>([]);
+  const [currentPreset, setCurrentPreset] = useState<string | null>(null);
   // ── workspace state (driven by server's workspace_list/changed events) ──
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [currentWs, setCurrentWs] = useState<{ id: string | null; name: string }>({ id: null, name: "" });
@@ -621,6 +665,7 @@ export default function App() {
   // effect that depends on ws.recording lives *after* the useVoiceWS
   // call below so ``ws`` is in scope.
   const [recordingStartedAt, setRecordingStartedAt] = useState<number | null>(null);
+  const [semanticSignal, setSemanticSignal] = useState<NeuralSemanticSignal | null>(null);
   const audioQueue = useAudioQueue();
 
   // Per-tab session id; refresh = brand-new conversation.
@@ -630,6 +675,14 @@ export default function App() {
       : `s-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`),
     [],
   );
+  const showDebugConsole = useMemo(() => {
+    try {
+      return new URLSearchParams(window.location.search).get("debug") === "1";
+    } catch {
+      return false;
+    }
+  }, []);
+  const simpleRootRef = useRef<HTMLDivElement | null>(null);
 
   // Ref to the currently-streaming assistant entry id, so token/audio
   // events know which row to mutate without each event re-finding it.
@@ -642,6 +695,8 @@ export default function App() {
   const turnT0Ref = useRef<number>(0);
   const firstTokenAtRef = useRef<number | null>(null);
   const firstAudioAtRef = useRef<number | null>(null);
+  const semanticNonceRef = useRef(0);
+  const lastPartialPulseAtRef = useRef(0);
 
   const append = useCallback((e: Omit<Entry, "id"> & { id?: string }) => {
     setEntries((prev) => [
@@ -666,15 +721,43 @@ export default function App() {
     setChatting(true);
   }, []);
 
+  const pulseSemantic = useCallback((
+    text: string,
+    source: NeuralSemanticSignal["source"],
+    strength = 1,
+  ) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const now = performance.now();
+    if (source === "user" && strength < 0.7 && now - lastPartialPulseAtRef.current < 120) return;
+    if (source === "user" && strength < 0.7) lastPartialPulseAtRef.current = now;
+    semanticNonceRef.current += 1;
+    setSemanticSignal({
+      nonce: semanticNonceRef.current,
+      text: trimmed.slice(-220),
+      source,
+      strength,
+    });
+  }, []);
+
+  const applyConfigSnapshot = useCallback((info: ConfigSnapshot) => {
+    setServerInfo({
+      asr_model_id: info.asr_model_id,
+      tts_model_id: info.tts_model_id,
+      llm_model_id: info.llm_model_id,
+    });
+    if (info.presets) setPresets(info.presets);
+    setCurrentPreset(info.preset ?? null);
+  }, []);
+
   const ws = useVoiceWS(sessionId, {
-    onReady: (info) => {
-      setServerInfo({
-        asr_model_id: info.asr_model_id,
-        tts_model_id: info.tts_model_id,
-        llm_model_id: info.llm_model_id,
-      });
+    onReady: applyConfigSnapshot,
+    onPresetChanged: (info) => {
+      applyConfigSnapshot(info);
+      append({ kind: "system", text: `已切换预设 → ${info.preset ?? "?"}(ASR ${info.asr_provider} · LLM ${info.llm_provider} · TTS ${info.tts_provider})` });
     },
     onAsrPartial: (p) => {
+      pulseSemantic(p.stable_text || p.text, "user", 0.42);
       // Live transcription as the user is still speaking. Mutate the
       // existing partial bubble or create one on the first event.
       setEntries((prev) => {
@@ -712,6 +795,7 @@ export default function App() {
         });
         return;
       }
+      pulseSemantic(t.text, "user", 1);
       if (partialId) {
         // Finalize the existing partial bubble in-place rather than
         // adding a second one — keeps the visual continuity.
@@ -752,7 +836,7 @@ export default function App() {
       if (!id) return;
       setEntries((prev) => prev.map((e) => e.id === id ? { ...e, text: e.text + delta } : e));
     },
-    onAudioChunk: (b64, _text, _idx, _dur, _synth) => {
+    onAudioChunk: (b64) => {
       if (firstAudioAtRef.current === null) {
         firstAudioAtRef.current = Math.round(performance.now() - turnT0Ref.current);
       }
@@ -767,6 +851,7 @@ export default function App() {
       }
     },
     onChatDone: (s) => {
+      pulseSemantic(s.full_text, "assistant", 0.88);
       const id = activeAssistantIdRef.current;
       if (id) {
         setEntries((prev) => prev.map((e) =>
@@ -820,6 +905,7 @@ export default function App() {
     onTranscriptPolished: (p) => {
       setPolishing(false);
       if (p.skipped || p.text === p.raw) return;
+      pulseSemantic(p.text, "ontology", 0.72);
       // Replace the most recent user bubble's text with polished + keep raw for diff
       setEntries((prev) => {
         const idx = [...prev].reverse().findIndex((e) => e.kind === "user");
@@ -838,6 +924,7 @@ export default function App() {
     },
     onRetry: (r) => {
       const text = `⟳ ${r.where} 重试 ${r.attempt}/${r.max_attempts} (${r.wait_ms}ms 后)  ${r.reason}`;
+      pulseSemantic(`${r.where} ${r.reason}`, "system", 0.62);
       setRetryBanner({ text, until: Date.now() + 6000 });
       // also leave a system message so user has a record
       append({ kind: "system", text });
@@ -858,12 +945,14 @@ export default function App() {
         set_workspace: "已切到",
       }[c.intent] || "→";
       const label = c.name ? `${verb} ${c.name}` : "已退出工作区";
+      pulseSemantic(label, "system", 0.55);
       setLastAction({ text: `✦ ${label}`, until: Date.now() + 4000 });
       // Drop a clear divider entry in conversation log
       append({ kind: "system", text: `── ${label} ──` });
     },
     onIntentAck: (a) => {
       const ms = a.ms_classify + a.ms_handle;
+      pulseSemantic(`${a.intent} ${a.text}`, "ontology", 0.9);
       append({ kind: "system", text: `✦ ${a.intent}  ${a.text}  (${ms}ms)` });
     },
     onVoiceSet: (v) => {
@@ -891,9 +980,39 @@ export default function App() {
     setRecordingStartedAt(ws.recording ? Date.now() : null);
   }, [ws.recording]);
 
+  const voiceVisualState = useMemo<NeuralVoiceApiState>(() => ({
+    connected: ws.connected,
+    recording: ws.recording,
+    polishing,
+    chatting,
+    playing: audioQueue.playing,
+    level: ws.level,
+    peak: ws.peak,
+    retrying: Boolean(retryBanner),
+    latencyMs: latestTranscribeMs,
+    workspaceActive: Boolean(currentWs.id),
+    semanticSignal,
+  }), [
+    ws.connected,
+    ws.recording,
+    ws.level,
+    ws.peak,
+    polishing,
+    chatting,
+    audioQueue.playing,
+    retryBanner,
+    latestTranscribeMs,
+    currentWs.id,
+    semanticSignal,
+  ]);
+
   // Cold-load: hydrate the conversation panel from SQLite (read-only —
   // server-side LLM history is per-session, but ASR transcripts persist).
   useEffect(() => {
+    if (!showDebugConsole) {
+      setHistoryLoaded(true);
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
@@ -926,16 +1045,16 @@ export default function App() {
           ...restored,
         ]);
         setHistoryLoaded(true);
-      } catch (err: any) {
+      } catch (err: unknown) {
         setEntries((prev) => [
           ...prev,
-          { id: "history-err", kind: "system", text: `历史加载失败: ${err?.message || err}` },
+          { id: "history-err", kind: "system", text: `历史加载失败: ${errorMessage(err)}` },
         ]);
         setHistoryLoaded(true);
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [showDebugConsole]);
 
   // Auto-scroll to newest entry on update.
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -948,7 +1067,7 @@ export default function App() {
       const resp = await fetch(`/api/history/${transcriptId}`, { method: "DELETE" });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       setEntries((prev) => prev.filter((e) => e.id !== entryId));
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.warn("delete failed", err);
     }
   }, []);
@@ -981,13 +1100,18 @@ export default function App() {
     ws.reset();
   }, [ws, audioQueue]);
 
+  const switchPreset = useCallback((name: string) => {
+    if (name && name !== currentPreset) ws.send({ type: "set_preset", preset: name });
+  }, [currentPreset, ws]);
+
   /* Push-to-talk handlers — the AudioWorklet starts pushing PCM as soon
      as startRecording resolves. New recording mid-AI-reply implicitly
      interrupts (server cancels chat task). */
   const onPressStart = useCallback(() => {
     audioQueue.stop();
+    pulseSemantic("voice input", "audio", 0.36);
     void ws.startRecording();
-  }, [audioQueue, ws]);
+  }, [audioQueue, pulseSemantic, ws]);
 
   const onPressEnd = useCallback(() => {
     if (ws.recording) ws.stopRecording();
@@ -1035,6 +1159,87 @@ export default function App() {
     };
   }, [ws.recording, onPressStart, onPressEnd]);
 
+  useEffect(() => {
+    if (!showDebugConsole) simpleRootRef.current?.focus();
+  }, [showDebugConsole]);
+
+  if (!showDebugConsole) {
+    return (
+      <div
+        ref={simpleRootRef}
+        tabIndex={0}
+        onKeyDown={onKeyDown}
+        onKeyUp={onKeyUp}
+        className="relative flex h-full min-h-0 items-center justify-center overflow-hidden bg-(--color-bg) px-6 py-8 outline-none"
+      >
+        <div className="relative flex w-full max-w-[820px] flex-col items-center gap-5">
+          <div
+            className="relative w-full overflow-hidden rounded-[28px]"
+            style={{
+              background: "rgba(10,10,16,0.72)",
+              backdropFilter: "blur(40px) saturate(140%)",
+              WebkitBackdropFilter: "blur(40px) saturate(140%)",
+              boxShadow:
+                "0 40px 100px -24px rgba(0,0,0,0.64), inset 0 0 0 1px rgba(255,255,255,0.075), 0 0 72px rgba(107,214,200,0.08)",
+            }}
+          >
+            <NeuralVoiceField
+              apiState={voiceVisualState}
+              frameless
+              className="h-[60vh] max-h-[500px] min-h-[320px] w-full"
+            />
+          </div>
+          <div className="flex items-center gap-2 rounded-full border border-(--color-border) bg-(--color-panel) p-2 shadow-[0_18px_50px_rgba(0,0,0,0.28)]">
+            {chatting && (
+              <button
+                type="button"
+                onClick={() => { ws.interrupt(); audioQueue.stop(); }}
+                className="flex size-10 items-center justify-center rounded-full border border-amber-500/50 text-amber-300 transition hover:bg-amber-500/10"
+                aria-label="打断"
+                title="打断"
+              >
+                <StopCircle size={18} />
+              </button>
+            )}
+            <button
+              type="button"
+              onMouseDown={onPressStart}
+              onMouseUp={onPressEnd}
+              onMouseLeave={() => { if (ws.recording) onPressEnd(); }}
+              onTouchStart={(e) => { e.preventDefault(); onPressStart(); }}
+              onTouchEnd={(e) => { e.preventDefault(); onPressEnd(); }}
+              disabled={!ws.connected}
+              className={`flex size-14 items-center justify-center rounded-full border-2 transition ${
+                ws.recording
+                  ? "border-amber-400 bg-amber-500/25 text-amber-200 shadow-[0_0_30px_rgba(245,158,11,0.28)]"
+                  : !ws.connected
+                    ? "cursor-not-allowed border-(--color-border) text-(--color-muted) opacity-45"
+                    : "border-cyan-400/45 text-cyan-100 hover:border-amber-400 hover:text-amber-200"
+              }`}
+              aria-label="按住录音"
+              title="按住录音 / Space / ⌘⇧Space"
+            >
+              {ws.recording ? (
+                <Square size={17} className="fill-amber-300 text-amber-300" />
+              ) : (
+                <Mic size={20} />
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={resetConversation}
+              className="flex size-10 items-center justify-center rounded-full border border-(--color-border) text-(--color-muted) transition hover:border-(--color-accent) hover:text-(--color-accent)"
+              aria-label="重置"
+              title="重置"
+            >
+              <RefreshCw size={17} />
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full flex-col">
       {/* Header — dense single-row status bar, TUI vibe.
@@ -1072,6 +1277,22 @@ export default function App() {
                 <span className="text-cyan-400">{serverInfo.tts_model_id.split("/").pop()?.replace("Qwen3-TTS-12Hz-", "")}</span>
               </span>
             </div>
+          )}
+          {/* Preset switcher — flips the whole provider stack at runtime */}
+          {presets.length > 0 && (
+            <label className="flex items-center gap-1 whitespace-nowrap" title="切换 provider 预设(运行时,下一轮生效)">
+              <span className="opacity-60 text-(--color-muted)">预设</span>
+              <select
+                value={currentPreset ?? ""}
+                onChange={(e) => switchPreset(e.target.value)}
+                className="rounded border border-(--color-border) bg-(--color-bg) px-1.5 py-0.5 text-(--color-text) focus:outline-none focus:border-(--color-accent)"
+              >
+                {currentPreset === null && <option value="">默认(.env)</option>}
+                {presets.map((p) => (
+                  <option key={p.name} value={p.name}>{p.label}</option>
+                ))}
+              </select>
+            </label>
           )}
           {/* Latency stats — right-aligned via flex-1 spacer */}
           <div className="flex-1" />
@@ -1194,6 +1415,13 @@ export default function App() {
           ✨ 整理中…
         </div>
       )}
+
+      {/* API-state visualizer — always visible, not part of the auto-scrolled chat log. */}
+      <div className="border-b border-(--color-border) bg-(--color-bg) px-6 py-3">
+        <div className="mx-auto max-w-3xl">
+          <NeuralVoiceField apiState={voiceVisualState} className="h-32 sm:h-36" />
+        </div>
+      </div>
 
       {/* Conversation */}
       <section ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-8">

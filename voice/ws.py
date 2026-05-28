@@ -51,7 +51,7 @@ import base64
 from . import db
 from .chat import reset_conversation, run_chat_pipeline
 from .chat import synth_one
-from .config import settings
+from .config import settings, apply_preset, current_preset, preset_options
 from .intents import process_intent
 from .intents.workspace_cache import WorkspaceCache
 from .meta_commands import MetaCommand, MetaMatch, match as match_meta_command
@@ -248,9 +248,10 @@ class WsSession:
 
     # --- ready frame --------------------------------------------------------
 
-    async def send_ready(self) -> None:
-        await self.send_json({
-            "type": "ready",
+    def _config_snapshot(self) -> dict:
+        """Current provider stack + preset state — shared by the ready
+        event and preset_changed so clients render one consistent view."""
+        return {
             "asr_provider": settings.asr.provider,
             "asr_model_id": settings.asr_active_model_id,
             "tts_provider": settings.tts.provider,
@@ -259,7 +260,12 @@ class WsSession:
             "llm_provider": settings.llm.provider,
             "llm_model_id": settings.llm_active_model_id,
             "tts_sr": settings.tts.sr,
-        })
+            "preset": current_preset(),
+            "presets": preset_options(),
+        }
+
+    async def send_ready(self) -> None:
+        await self.send_json({"type": "ready", **self._config_snapshot()})
 
     # --- event handlers -----------------------------------------------------
 
@@ -693,6 +699,23 @@ class WsSession:
             "error": None,
         })
 
+    async def handle_set_preset(self, ev: dict) -> None:
+        """Switch the whole provider stack at runtime (global, no restart).
+        The new providers take effect on the next recording / chat turn —
+        the ASR session is built per-recording and chat reads providers per
+        turn. Cancels any in-flight chat so the next turn uses the new stack.
+        Switching INTO a local-MLX preset lazy-loads the model on first use
+        (one-time pause)."""
+        name = (ev.get("preset") or ev.get("name") or "").strip()
+        try:
+            apply_preset(name)
+        except KeyError:
+            await self.send_json({"type": "error", "where": "set_preset",
+                                  "message": f"unknown preset: {name!r}"})
+            return
+        await self.cancel_chat("preset_switch")
+        await self.send_json({"type": "preset_changed", **self._config_snapshot()})
+
     async def handle_refresh_workspaces(self, ev: dict) -> None:
         """Client-triggered refresh — re-fetch ablework /workspaces and
         emit a fresh workspace_list event."""
@@ -711,6 +734,7 @@ class WsSession:
         "set_voice":          "handle_set_voice",
         "set_polish":         "handle_set_polish",
         "set_workspace":      "handle_set_workspace",
+        "set_preset":         "handle_set_preset",
         "refresh_workspaces": "handle_refresh_workspaces",
     }
 

@@ -13,44 +13,34 @@ stream thread (see runtime.py for why).
 
 DashScope realtime path
 =======================
-``paraformer-realtime-v2`` (default) and ``qwen3-asr-flash-realtime``
-both share the same ``api-ws/v1/inference/`` endpoint + run-task /
-result-generated / finish-task event shape, so a single provider class
-serves both. The difference is HOW you bias for proper nouns:
+Two cloud models, two DIFFERENT endpoints + protocols — one provider
+class each:
 
-  - paraformer-realtime-v2 → ``parameters.vocabulary_id`` (managed cloud-
-    side via scripts/manage_vocabulary.py; see
-    DASHSCOPE_ASR_VOCABULARY_ID env)
-  - qwen3-asr-flash-realtime → ``input.context`` natural-language prompt
-    (e.g. "Technical terms: 宁德时代, 科创50, 贵州茅台"; see
-    DASHSCOPE_ASR_CONTEXT env)
+  - ``paraformer-realtime-v2`` (default) → ``DashscopeRealtimeAsr``
+    Endpoint ``api-ws/v1/inference/``; run-task / result-generated /
+    finish-task frames. Binary PCM frames. Hotwords via
+    ``parameters.vocabulary_id`` (DASHSCOPE_ASR_VOCABULARY_ID, managed
+    cloud-side via scripts/manage_vocabulary.py).
 
-The provider passes whichever envs are set — paraformer ignores
-unknown ``input.context`` and qwen3 ignores unknown
-``parameters.vocabulary_id``, so leaving the unused one empty is safe.
+  - ``qwen3-asr-flash-realtime`` → ``DashscopeQwenRealtimeAsr``
+    Endpoint ``api-ws/v1/realtime?model=…``; OpenAI-Realtime-style
+    events (session.update / input_audio_buffer.append [base64 PCM] /
+    commit / session.finish; results on
+    conversation.item.input_audio_transcription.text + .completed).
 
-Protocol:
-    1. connect with Authorization bearer <key>
-    2. send JSON ``run-task`` (task_group=audio / task=asr / function=
-       recognition, model, sample_rate, format=pcm, [vocabulary_id],
-       [context])
-    3. wait for header.event == ``task-started``
-    4. send binary PCM frames (int16 LE, mono)
-    5. JSON ``result-generated`` events carry cumulative text on
-       payload.output.sentence.text — forward each as a partial
-       (also runs a LocalAgreement-2 stabilizer to surface a stable_text
-       prefix the UI can render in normal weight)
-    6. send ``finish-task`` → wait for ``task-finished`` → take last
-       partial text as the final transcript
+NOTE: an earlier revision claimed both models shared the inference
+endpoint and run-task shape — that was wrong (DashScope returns
+"Model not found" for qwen3 on the inference endpoint). They are
+genuinely different wire protocols; ``get_asr`` routes by model name.
 
 To A/B test qwen3 vs paraformer:
     DASHSCOPE_ASR_MODEL=qwen3-asr-flash-realtime ./start-tui.sh
-    DASHSCOPE_ASR_CONTEXT='Technical terms: 宁德时代, 科创50' ...
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import ssl
@@ -343,6 +333,178 @@ class DashscopeRealtimeAsr:
             try: await self._ws.close()
             except Exception: pass
         self._finished.set()
+        if self._reader_task is not None and not self._reader_task.done():
+            self._reader_task.cancel()
+            try: await self._reader_task
+            except Exception: pass
+
+
+# --- DashScope qwen3-asr-flash-realtime AsrSession --------------------------
+
+class DashscopeQwenRealtimeAsr:
+    """Bridge to ``qwen3-asr-flash-realtime`` over DashScope's
+    OpenAI-Realtime-style WS (``api-ws/v1/realtime``). Distinct endpoint +
+    event shape from the paraformer run-task protocol — see module docstring.
+
+    Two turn modes (DASHSCOPE_ASR_REALTIME_VAD):
+
+      - VAD (server_vad, default): the server transcribes DURING speech and
+        streams ``…transcription.text`` partials; each detected turn ends
+        with a ``…transcription.completed``. We accumulate completed
+        segments and flush the tail with ``session.finish`` on stop. Lower
+        finalize latency (transcription overlaps recording) + live partials.
+
+      - manual (turn_detection null): all PCM is buffered, then ``commit`` +
+        ``session.finish`` on stop produce one ``…completed``. No partials.
+
+    Audio is base64-encoded PCM16 in ``input_audio_buffer.append`` frames
+    (this protocol has no binary frame mode, unlike paraformer)."""
+
+    def __init__(self, sample_rate: int, on_partial: OnPartial):
+        self._sr = sample_rate
+        self._on_partial = on_partial
+        self._ws = None
+        self._last_text = ""
+        self._segments: list[str] = []     # one per …transcription.completed
+        self._ready = asyncio.Event()      # session.created / session.updated
+        self._completed = asyncio.Event()  # session end / socket close
+        self._reader_task: Optional[asyncio.Task] = None
+
+    @property
+    def model_id(self) -> str:
+        return f"dashscope:{settings.dashscope.asr_model}"
+
+    def _url(self) -> str:
+        base = settings.dashscope.asr_realtime_ws_url.rstrip("/")
+        return f"{base}?model={settings.dashscope.asr_model}"
+
+    async def start(self) -> None:
+        if not settings.dashscope.api_key:
+            raise RuntimeError("ASR_PROVIDER=dashscope but DASHSCOPE_API_KEY not set")
+
+        async def _attempt() -> None:
+            sslctx = ssl.create_default_context()
+            sslctx.check_hostname = False
+            sslctx.verify_mode = ssl.CERT_NONE
+            self._ws = await _wspkg.connect(
+                self._url(),
+                additional_headers={"Authorization": f"bearer {settings.dashscope.api_key}"},
+                ssl=sslctx,
+                max_size=None,
+            )
+            self._ready = asyncio.Event()
+            self._completed = asyncio.Event()
+            self._reader_task = asyncio.create_task(self._reader(), name="qwen-asr-reader")
+            # Configure the session: PCM16 @ sr + language hint. VAD mode
+            # streams partials and overlaps transcription with recording;
+            # manual mode (null) waits for our explicit commit on stop.
+            turn_detection = (
+                {"type": "server_vad",
+                 "silence_duration_ms": settings.dashscope.asr_realtime_silence_ms}
+                if settings.dashscope.asr_realtime_vad else None
+            )
+            await self._ws.send(json.dumps({
+                "event_id": uuid.uuid4().hex,
+                "type": "session.update",
+                "session": {
+                    "modalities": ["text"],
+                    "input_audio_format": "pcm",
+                    "sample_rate": self._sr,
+                    "input_audio_transcription": {"language": settings.dashscope.asr_lang},
+                    "turn_detection": turn_detection,
+                },
+            }))
+            # Wait until the server acks the session is live before feeding
+            # audio — otherwise early appends race the session.update.
+            await asyncio.wait_for(self._ready.wait(), timeout=5)
+
+        await with_retries(_attempt)
+
+    async def _reader(self) -> None:
+        try:
+            async for msg in self._ws:
+                if not isinstance(msg, str):
+                    continue
+                try:
+                    ev = json.loads(msg)
+                except json.JSONDecodeError:
+                    continue
+                t = ev.get("type")
+                if t in ("session.created", "session.updated"):
+                    self._ready.set()
+                elif t == "conversation.item.input_audio_transcription.text":
+                    text = ev.get("text") or ""
+                    if text and text != self._last_text:
+                        self._last_text = text
+                        # No separate stable-prefix from this protocol — pass
+                        # text as both current + committed (UI just renders it).
+                        try:
+                            await self._on_partial(text, text)
+                        except Exception:
+                            logger.exception("on_partial callback raised")
+                elif t == "conversation.item.input_audio_transcription.completed":
+                    tr = ev.get("transcript") or ""
+                    if tr:
+                        self._segments.append(tr)
+                        self._last_text = tr
+                    # Manual mode = a single turn, so this IS the final →
+                    # unblock finish() now. VAD mode may produce more turns;
+                    # wait for the session-end event instead.
+                    if not settings.dashscope.asr_realtime_vad:
+                        self._completed.set()
+                elif t == "error":
+                    logger.warning("qwen3-asr realtime error: %s",
+                                   ev.get("error") or ev.get("message") or ev)
+                elif t in ("session.finished", "session.done"):
+                    self._completed.set()
+                    break
+        except _wspkg.exceptions.ConnectionClosed:
+            pass
+        except Exception:
+            logger.exception("qwen3-asr realtime reader crashed")
+        finally:
+            self._ready.set()      # unblock start() even on early failure
+            self._completed.set()  # unblock finish()
+
+    async def feed(self, pcm_bytes: bytes) -> None:
+        if self._ws is None or self._completed.is_set():
+            return
+        try:
+            await self._ws.send(json.dumps({
+                "event_id": uuid.uuid4().hex,
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(pcm_bytes).decode("ascii"),
+            }))
+        except _wspkg.exceptions.ConnectionClosed:
+            self._completed.set()
+
+    async def finish(self) -> str:
+        if self._ws is None:
+            return self._last_text
+        try:
+            # Manual mode: submit the buffered audio. VAD mode auto-commits
+            # on silence, so an explicit commit can error — just finish.
+            if not settings.dashscope.asr_realtime_vad:
+                await self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            await self._ws.send(json.dumps({"type": "session.finish"}))
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(self._completed.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("qwen3-asr realtime finish timeout")
+        try:
+            await self._ws.close()
+        except Exception:
+            pass
+        # Chinese has no inter-word spaces; join VAD segments directly.
+        return "".join(self._segments) or self._last_text
+
+    async def cancel(self) -> None:
+        if self._ws is not None:
+            try: await self._ws.close()
+            except Exception: pass
+        self._completed.set()
         if self._reader_task is not None and not self._reader_task.done():
             self._reader_task.cancel()
             try: await self._reader_task

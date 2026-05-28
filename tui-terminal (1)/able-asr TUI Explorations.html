@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>able-asr TUI · Design Explorations</title>
+  <meta name="viewport" content="width=1440" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&family=Noto+Sans+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=Caveat:wght@500;600;700&display=swap" />
+  <link rel="stylesheet" href="styles.css" />
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script type="text/babel" src="design-canvas.jsx"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="tui-primitives.jsx"></script>
+  <script type="text/babel" src="v1-powerline.jsx"></script>
+  <script type="text/babel" src="v2-siderail.jsx"></script>
+  <script type="text/babel" src="v3-stream.jsx"></script>
+  <script type="text/babel" src="v4-bottomstack.jsx"></script>
+  <script type="text/babel" src="v5-breadcrumb.jsx"></script>
+  <script type="text/babel" src="v6-split.jsx"></script>
+  <script type="text/babel" src="v7-waveform.jsx"></script>
+  <script type="text/babel" src="v9-timeline.jsx"></script>
+  <script type="text/babel" src="v8-spatial.jsx"></script>
+  <script type="text/babel" src="v10-editor.jsx"></script>
+  <script type="text/babel" src="v11-ambient.jsx"></script>
+  <script type="text/babel" src="v12-zen.jsx"></script>
+</head>
+<body>
+  <div class="cover">
+    <div class="eyebrow">able-asr · TUI design exploration</div>
+    <h1>Six directions for the <span class="accent">terminal</span> client</h1>
+    <p class="sub">
+      Six divergent takes on the able-asr TUI, each in <b>80-col</b> and <b>120/140-col</b>
+      mirrors and covering empty, recording, and streaming states. All within hard
+      constraints: monospace, ANSI 256, keyboard-only, fixed-height rows.
+    </p>
+    <div class="legend">
+      <span>monospace · JetBrains Mono</span>
+      <span>ANSI 256 only</span>
+      <span>spinner ⠋⠙⠹⠸⠼⠴⠦⠧</span>
+      <span>caret ▮ blink</span>
+    </div>
+  </div>
+
+  <div id="canvas-root"></div>
+  <div id="tweaks-root"></div>
+
+  <script type="text/babel" data-presets="react">
+    const { useEffect, useState } = React;
+
+    const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+      "terminalFont": "JetBrains Mono",
+      "uiTheme": "dark",
+      "accentRole": "warm",
+      "fontSize": 13,
+      "bubbleStyle": "panel"
+    }/*EDITMODE-END*/;
+
+    function applyTweaks(t) {
+      const root = document.documentElement;
+      // Font
+      const fontMap = {
+        "JetBrains Mono": '"JetBrains Mono", monospace',
+        "IBM Plex Mono": '"IBM Plex Mono", monospace',
+        "Noto Sans Mono": '"Noto Sans Mono", monospace',
+        "Cascadia Mono": '"Cascadia Mono", monospace',
+      };
+      root.style.setProperty("--mono", fontMap[t.terminalFont] || fontMap["JetBrains Mono"]);
+
+      // Theme: swap palette tokens at the root
+      const themes = {
+        dark: {
+          "--tt-bg": "#181613",
+          "--tt-bg-soft": "#201d19",
+          "--tt-fg": "#e6e0d4",
+          "--tt-fg-soft": "#cabfa9",
+          "--tt-dim": "#8a8378",
+          "--tt-faint": "#5b5650",
+          "--tt-border": "#3a352d",
+        },
+        light: {
+          "--tt-bg": "#f7f3e9",
+          "--tt-bg-soft": "#efeadc",
+          "--tt-fg": "#2a251f",
+          "--tt-fg-soft": "#4a4439",
+          "--tt-dim": "#6b665b",
+          "--tt-faint": "#908a7c",
+          "--tt-border": "#c8bfa9",
+        },
+        "high-contrast": {
+          "--tt-bg": "#000000",
+          "--tt-bg-soft": "#0a0a0a",
+          "--tt-fg": "#ffffff",
+          "--tt-fg-soft": "#e8e8e8",
+          "--tt-dim": "#a0a0a0",
+          "--tt-faint": "#6a6a6a",
+          "--tt-border": "#666666",
+        },
+      };
+      const pal = themes[t.uiTheme] || themes.dark;
+      Object.entries(pal).forEach(([k, v]) => root.style.setProperty(k, v));
+
+      // Accent role recolor (subtle)
+      const accents = {
+        warm:    { "--ansi-cyan": "#6bd6c8", "--ansi-green": "#7ec27a", "--ansi-yellow": "#e6c466", "--ansi-magenta": "#c98ad6" },
+        cool:    { "--ansi-cyan": "#6fb3ff", "--ansi-green": "#7ad3a0", "--ansi-yellow": "#d6c46b", "--ansi-magenta": "#8fa3ff" },
+        amber:   { "--ansi-cyan": "#e6c466", "--ansi-green": "#e6c466", "--ansi-yellow": "#e6c466", "--ansi-magenta": "#e6c466" },
+        classic: { "--ansi-cyan": "#00d7d7", "--ansi-green": "#00af5f", "--ansi-yellow": "#ffd75f", "--ansi-magenta": "#d75fd7" },
+      };
+      const acc = accents[t.accentRole] || accents.warm;
+      Object.entries(acc).forEach(([k, v]) => root.style.setProperty(k, v));
+
+      // Font size — propagate to .term default if needed
+      document.querySelectorAll(".term").forEach((el) => {
+        el.style.fontSize = `${t.fontSize}px`;
+      });
+    }
+
+    function TweaksWidget() {
+      const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
+      useEffect(() => applyTweaks(tweaks), [tweaks]);
+      return (
+        <TweaksPanel title="Tweaks">
+          <TweakSection title="Theme">
+            <TweakRadio
+              label="UI theme"
+              value={tweaks.uiTheme}
+              options={[
+                { value: "dark",          label: "dark" },
+                { value: "light",         label: "light" },
+                { value: "high-contrast", label: "HC" },
+              ]}
+              onChange={(v) => setTweak("uiTheme", v)}
+            />
+            <TweakSelect
+              label="Accent role"
+              value={tweaks.accentRole}
+              options={[
+                { value: "warm",    label: "Warm (default)" },
+                { value: "cool",    label: "Cool" },
+                { value: "amber",   label: "Amber-only" },
+                { value: "classic", label: "Classic ANSI" },
+              ]}
+              onChange={(v) => setTweak("accentRole", v)}
+            />
+          </TweakSection>
+          <TweakSection title="Type">
+            <TweakSelect
+              label="Mono font"
+              value={tweaks.terminalFont}
+              options={[
+                { value: "JetBrains Mono",  label: "JetBrains Mono" },
+                { value: "IBM Plex Mono",   label: "IBM Plex Mono" },
+                { value: "Noto Sans Mono",  label: "Noto Sans Mono" },
+                { value: "Cascadia Mono",   label: "Cascadia Mono" },
+              ]}
+              onChange={(v) => setTweak("terminalFont", v)}
+            />
+            <TweakSlider
+              label="Font size (px)"
+              value={tweaks.fontSize}
+              min={11}
+              max={16}
+              step={0.5}
+              onChange={(v) => setTweak("fontSize", v)}
+            />
+          </TweakSection>
+        </TweaksPanel>
+      );
+    }
+
+    function App() {
+      return (
+        <DesignCanvas
+          background="#ece8df"
+          gridColor="rgba(42,37,31,0.06)"
+          initialZoom={0.95}
+        >
+          <DCSection id="v1" title="V1 · Powerline Modeline" subtitle="Collapse top 3 chrome rows into one segmented bottom bar">
+            <DCArtboard id="v1-board" label="V1 · 80-col empty + 120-col streaming" width={1280} height={1080}>
+              <V1 />
+            </DCArtboard>
+          </DCSection>
+
+          <DCSection id="v2" title="V2 · Side-rail Dashboard" subtitle="Wide-screen rail with telemetry · narrow collapses to 1 row">
+            <DCArtboard id="v2-board" label="V2 · 140-col rail + 80-col fallback" width={1280} height={1180}>
+              <V2 />
+            </DCArtboard>
+          </DCSection>
+
+          <DCSection id="v3" title="V3 · Stream Transcript" subtitle="No panels · gutter timestamps · max density">
+            <DCArtboard id="v3-board" label="V3 · 80-col empty + 120-col active" width={1280} height={1080}>
+              <V3 />
+            </DCArtboard>
+          </DCSection>
+
+          <DCSection id="v4" title="V4 · Compact Bottom-Stack" subtitle="All chrome sinks to a 3-row bottom · sparkline latency">
+            <DCArtboard id="v4-board" label="V4 · 80-col welcome + 120-col recording" width={1280} height={1100}>
+              <V4 />
+            </DCArtboard>
+          </DCSection>
+
+          <DCSection id="v5" title="V5 · Breadcrumb Chat" subtitle="Workspace as path · segmented mode pill · light-theme default">
+            <DCArtboard id="v5-board" label="V5 · 80-col empty + 120-col streaming · light" width={1280} height={1100}>
+              <V5 />
+            </DCArtboard>
+          </DCSection>
+
+          <DCSection id="v6" title="V6 · Split Dashboard" subtitle="Wide-screen telemetry pane · narrow-screen tabbed">
+            <DCArtboard id="v6-board" label="V6 · 140-col dashboard + 80-col tabbed" width={1280} height={1280}>
+              <V6 />
+            </DCArtboard>
+          </DCSection>
+
+          <DCSection id="subversive" title="More disruptive — change the metaphor" subtitle="V7 / V9 require OpenTUI or Ink + Yoga (Textual can't render these well)">
+            <DCArtboard id="v7-board" label="V7 · Waveform-first · idle + recording" width={1280} height={1040}>
+              <V7 />
+            </DCArtboard>
+            <DCArtboard id="v9-board" label="V9 · Timeline / Gantt · 80 + 140 col" width={1380} height={1120}>
+              <V9 />
+            </DCArtboard>
+            <DCArtboard id="framework" label="Recommended stack" width={1180} height={520}>
+              <div style={{ padding: 32, fontFamily: "Inter", color: "#2a251f", fontSize: 14, lineHeight: 1.65, maxWidth: 1000 }}>
+                <div style={{ fontFamily: "JetBrains Mono", fontSize: 13, fontWeight: 700, marginBottom: 14, letterSpacing: "0.05em" }}>STACK · 2026</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 28 }}>
+                  <div>
+                    <div style={{ fontWeight: 700, marginBottom: 6 }}>OpenTUI <span style={{ color: "#c96442", fontFamily: "JetBrains Mono", fontSize: 11 }}>recommended</span></div>
+                    <p style={{ margin: 0, color: "#4a4439" }}>
+                      Zig core + TypeScript React reconciler. Yoga flexbox (real CSS-like layout), tree-sitter syntax highlighting, animations timeline API, built-in <code style={{ fontFamily: "JetBrains Mono" }}>ScrollBox</code> / <code style={{ fontFamily: "JetBrains Mono" }}>Code</code> / <code style={{ fontFamily: "JetBrains Mono" }}>Diff</code> / <code style={{ fontFamily: "JetBrains Mono" }}>Select</code>. Powers OpenCode in prod. Bun-exclusive today, Node coming.
+                    </p>
+                    <p style={{ marginTop: 10, marginBottom: 0, color: "#6b665b", fontSize: 13 }}>
+                      Unlocks for able-asr: smooth meter animation, braille waveform (V7), real scroll regions, inline diff for polish, gantt bars (V9).
+                    </p>
+                  </div>
+                  <div>
+                    <div style={{ fontWeight: 700, marginBottom: 6 }}>Ink — safer default</div>
+                    <p style={{ margin: 0, color: "#4a4439" }}>
+                      React for CLIs, Yoga flexbox, mature ecosystem. Used by Claude Code, Gemini CLI, GitHub Copilot CLI, Gatsby, Yarn, Prisma. <code style={{ fontFamily: "JetBrains Mono" }}>@inkjs/ui</code> gives you spinners, selects, progress bars.
+                    </p>
+                    <p style={{ marginTop: 10, marginBottom: 0, color: "#6b665b", fontSize: 13 }}>
+                      Lower ceiling on animation perf and sub-character rendering than OpenTUI, but the most boring-and-it-works path.
+                    </p>
+                  </div>
+                </div>
+                <div style={{ marginTop: 22, padding: 14, background: "#f4efe3", border: "1px dashed rgba(42,37,31,0.2)", borderRadius: 4, fontSize: 13, color: "#4a4439" }}>
+                  <b style={{ color: "#2a251f" }}>Stay on Textual</b> if shipping conservatively (V1 / V3 / V4 work fine in it). <b style={{ color: "#2a251f" }}>Migrate</b> if you want V7 (waveform) or V9 (gantt) — those need sub-char rendering and animation budgets Textual can't hit.
+                </div>
+              </div>
+            </DCArtboard>
+          </DCSection>
+
+          <DCSection id="future" title="Disruptive set — V8 / V10 / V11 / V12" subtitle="Each one challenges a different premise of the spec">
+            <DCArtboard id="v8-board" label="V8 · Spatial Workspace · split + overlay" width={1280} height={1020}>
+              <V8 />
+            </DCArtboard>
+            <DCArtboard id="v10-board" label="V10 · Editor Mode · leader + voice" width={1280} height={1080}>
+              <V10 />
+            </DCArtboard>
+            <DCArtboard id="v11-board" label="V11 · Ambient · 1-row tray + expand" width={1280} height={960}>
+              <V11 />
+            </DCArtboard>
+            <DCArtboard id="v12-board" label="V12 · Zen · 4 states" width={1280} height={1680}>
+              <V12 />
+            </DCArtboard>
+          </DCSection>
+
+          <DCSection id="end" title="Notes" subtitle="Trade-offs and recommended next steps">
+            <DCArtboard id="notes" label="What's next" width={1180} height={420}>
+              <div style={{ padding: 32, fontFamily: "Inter", color: "#2a251f", fontSize: 15, lineHeight: 1.7, maxWidth: 880 }}>
+                <p style={{margin: 0, marginBottom: 12, fontWeight: 600, fontFamily: "JetBrains Mono", fontSize: 14}}>Quick read</p>
+                <p style={{margin: 0, marginBottom: 14}}>
+                  <b>V1 / V4</b> are the most conservative — same IA, tighter use of rows. Lowest-risk shipable.
+                </p>
+                <p style={{margin: 0, marginBottom: 14}}>
+                  <b>V2 / V6</b> bet on wide terminals (which most devs have). V2 is a clean rail; V6 makes telemetry a first-class story (good for the latency demo).
+                </p>
+                <p style={{margin: 0, marginBottom: 14}}>
+                  <b>V3</b> kills the panels — densest, most "log-like". Best for long sessions, may feel less branded.
+                </p>
+                <p style={{margin: 0, marginBottom: 14}}>
+                  <b>V5</b> is the biggest IA shift — workspace as filesystem path + segmented pipeline pill. Most opinionated, ships best with a "spatial workspace" mental model.
+                </p>
+                <p style={{margin: 0, color: "#6b665b"}}>
+                  Try the <b>Tweaks</b> panel (toolbar toggle) to A/B theme, font, and bubble style across all 6 mocks at once.
+                </p>
+              </div>
+            </DCArtboard>
+          </DCSection>
+        </DesignCanvas>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("canvas-root"));
+    root.render(<App />);
+
+    const tweaksRoot = ReactDOM.createRoot(document.getElementById("tweaks-root"));
+    tweaksRoot.render(<TweaksWidget />);
+  </script>
+</body>
+</html>

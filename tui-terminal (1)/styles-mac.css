@@ -1,0 +1,220 @@
+/* ===== macOS client – shared styles ===== */
+
+/* Desktop backgrounds — these are the surface our HUDs/windows float on. */
+.mac-desktop {
+  position: relative;
+  overflow: hidden;
+  border-radius: 14px;
+  box-shadow:
+    inset 0 0 0 1px rgba(0,0,0,0.12),
+    0 1px 0 rgba(255,255,255,0.7) inset;
+}
+.mac-desktop.--dusk {
+  /* Sequoia-ish twilight gradient */
+  background:
+    radial-gradient(ellipse 70% 50% at 22% 12%, #c9b9ff 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 30%, #ffb088 0%, transparent 55%),
+    radial-gradient(ellipse 80% 60% at 50% 100%, #2b1f4a 0%, transparent 60%),
+    linear-gradient(180deg, #271d4a 0%, #4a2d52 50%, #1b1730 100%);
+}
+.mac-desktop.--dawn {
+  background:
+    radial-gradient(ellipse 90% 60% at 20% 0%, #ffd5b0 0%, transparent 55%),
+    radial-gradient(ellipse 80% 50% at 90% 10%, #ffafc8 0%, transparent 50%),
+    radial-gradient(ellipse 100% 60% at 50% 100%, #6c4d8a 0%, transparent 55%),
+    linear-gradient(180deg, #ffcdb0 0%, #d585a6 60%, #463264 100%);
+}
+.mac-desktop.--graphite {
+  background:
+    radial-gradient(ellipse 80% 60% at 20% 0%, #4a4a52 0%, transparent 55%),
+    radial-gradient(ellipse 80% 60% at 80% 100%, #1d1d22 0%, transparent 60%),
+    linear-gradient(180deg, #2a2a30 0%, #16161a 100%);
+}
+.mac-desktop.--noir {
+  background:
+    radial-gradient(ellipse 90% 70% at 30% 0%, #1a1a22 0%, transparent 55%),
+    linear-gradient(180deg, #0a0a0c 0%, #050505 100%);
+}
+
+/* macOS menu bar strip rendered at top of a desktop */
+.mac-menubar {
+  position: absolute; top: 0; left: 0; right: 0; height: 26px;
+  display: flex; align-items: center; gap: 16px;
+  padding: 0 14px;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
+  font-size: 13px;
+  color: rgba(255,255,255,0.95);
+  background: rgba(0,0,0,0.18);
+  backdrop-filter: blur(40px) saturate(180%);
+  -webkit-backdrop-filter: blur(40px) saturate(180%);
+  font-weight: 500;
+}
+.mac-menubar .apple { font-size: 14px; letter-spacing: -0.04em; }
+.mac-menubar .app-name { font-weight: 700; }
+.mac-menubar .menus { display: flex; gap: 14px; font-weight: 400; }
+.mac-menubar .spacer { flex: 1; }
+.mac-menubar .tray { display: flex; gap: 12px; align-items: center; font-feature-settings: "tnum"; }
+.mac-menubar .tray .item { display: inline-flex; align-items: center; gap: 4px; }
+.mac-menubar .tray .item.active {
+  background: rgba(255,255,255,0.15);
+  border-radius: 4px;
+  padding: 0 6px;
+  height: 18px;
+}
+
+/* HUD — the floating, rounded-corner panel summoned by hotkey */
+.hud {
+  position: absolute;
+  background: rgba(24,22,19,0.78);
+  color: #e6e0d4;
+  border-radius: 14px;
+  backdrop-filter: blur(60px) saturate(150%);
+  -webkit-backdrop-filter: blur(60px) saturate(150%);
+  box-shadow:
+    0 1px 0 rgba(255,255,255,0.08) inset,
+    0 0 0 1px rgba(255,255,255,0.06) inset,
+    0 30px 80px -20px rgba(0,0,0,0.55),
+    0 8px 20px -8px rgba(0,0,0,0.4);
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  overflow: hidden;
+}
+.hud.--light {
+  background: rgba(247,243,233,0.86);
+  color: #2a251f;
+  box-shadow:
+    0 1px 0 rgba(255,255,255,0.9) inset,
+    0 0 0 1px rgba(0,0,0,0.06) inset,
+    0 30px 80px -20px rgba(0,0,0,0.25),
+    0 8px 20px -8px rgba(0,0,0,0.18);
+}
+
+/* macOS window chrome (traffic lights row) */
+.mac-window {
+  position: absolute;
+  background: rgba(24,22,19,0.92);
+  color: #e6e0d4;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow:
+    0 1px 0 rgba(255,255,255,0.06) inset,
+    0 0 0 1px rgba(255,255,255,0.05) inset,
+    0 30px 80px -20px rgba(0,0,0,0.55);
+  font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+}
+.mac-window .titlebar {
+  display: flex; align-items: center;
+  height: 28px; padding: 0 10px; gap: 8px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(0,0,0,0.06));
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.mac-window .lights { display: flex; gap: 8px; }
+.mac-window .lights i { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+.mac-window .lights i:nth-child(1) { background: #ff5f57; box-shadow: inset 0 0 0 0.5px rgba(0,0,0,0.15); }
+.mac-window .lights i:nth-child(2) { background: #febc2e; box-shadow: inset 0 0 0 0.5px rgba(0,0,0,0.15); }
+.mac-window .lights i:nth-child(3) { background: #28c840; box-shadow: inset 0 0 0 0.5px rgba(0,0,0,0.15); }
+.mac-window .title {
+  flex: 1; text-align: center;
+  font-family: -apple-system, "SF Pro Text", sans-serif;
+  font-size: 13px; font-weight: 600;
+  color: rgba(230,224,212,0.7);
+  letter-spacing: -0.01em;
+}
+.mac-window .toolbar {
+  display: flex; gap: 8px; align-items: center;
+  height: 36px; padding: 0 12px;
+  background: rgba(0,0,0,0.18);
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  font-family: -apple-system, sans-serif;
+  font-size: 12px; color: rgba(230,224,212,0.7);
+}
+
+/* CRT skeumorphic — for M2 */
+.crt {
+  position: absolute;
+  padding: 20px 22px;
+  border-radius: 18px;
+  background: #0a1404;
+  color: #b8e066;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 14px;
+  line-height: 1.55;
+  box-shadow:
+    inset 0 0 0 6px #2a2620,
+    inset 0 0 0 8px #1a1814,
+    inset 0 0 0 12px #0e0c0a,
+    inset 0 0 80px rgba(184,224,102,0.12),
+    0 30px 60px -20px rgba(0,0,0,0.7);
+  overflow: hidden;
+}
+.crt::before {
+  /* scanlines */
+  content: "";
+  position: absolute; inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0,0,0,0.18) 0px,
+    rgba(0,0,0,0.18) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  pointer-events: none;
+}
+.crt::after {
+  /* phosphor vignette */
+  content: "";
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(ellipse 100% 80% at 50% 50%, transparent 40%, rgba(0,0,0,0.4) 100%);
+  pointer-events: none;
+}
+.crt .glow { text-shadow: 0 0 4px rgba(184,224,102,0.45), 0 0 12px rgba(184,224,102,0.15); }
+.crt.--amber { color: #f0b85c; background: #140a04; box-shadow:
+    inset 0 0 0 6px #2a2620,
+    inset 0 0 0 8px #1a1814,
+    inset 0 0 0 12px #0e0c0a,
+    inset 0 0 80px rgba(240,184,92,0.15),
+    0 30px 60px -20px rgba(0,0,0,0.7); }
+.crt.--amber .glow { text-shadow: 0 0 4px rgba(240,184,92,0.5), 0 0 12px rgba(240,184,92,0.2); }
+
+/* Block / scene wrapper */
+.scene {
+  padding: 28px;
+  background: #f4efe3;
+  border: 1px solid rgba(42,37,31,0.1);
+  border-radius: 4px;
+  position: relative;
+}
+.scene .scene-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  margin-bottom: 16px; gap: 16px;
+}
+.scene .scene-head h3 {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 15px; font-weight: 700; margin: 0; letter-spacing: 0.01em;
+}
+.scene .scene-head .meta {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px; color: rgba(42,37,31,0.55);
+  letter-spacing: 0.08em; text-transform: uppercase;
+}
+
+/* Frame caption like "M1 · HUD summoned" */
+.frame-caption {
+  margin: 10px 4px 0;
+  font-family: "Inter", sans-serif;
+  font-size: 12px; color: rgba(42,37,31,0.55);
+}
+.frame-caption b { color: #2a251f; font-weight: 600; }
+.frame-caption .tag {
+  display: inline-block; padding: 1px 7px; border-radius: 999px;
+  background: rgba(201,100,66,0.12); color: #c96442;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px; margin-right: 6px; letter-spacing: 0.04em;
+}
+
+/* Generic stage (a desktop with a HUD on it) — sized in px */
+.stage {
+  position: relative;
+  border-radius: 12px;
+  overflow: hidden;
+}

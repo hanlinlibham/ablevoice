@@ -1,0 +1,336 @@
+/* ====== Page (paper canvas) ====== */
+:root {
+  --paper: #ece8df;
+  --paper-line: rgba(42, 37, 31, 0.08);
+  --ink: #2a251f;
+  --ink-dim: rgba(42, 37, 31, 0.55);
+  --ink-faint: rgba(42, 37, 31, 0.32);
+  --pencil: rgba(42, 37, 31, 0.85);
+  --accent: #c96442;
+  --note-bg: #fef4a8;
+
+  /* Terminal palette — ANSI 256 inspired, dark default */
+  --tt-bg: #181613;
+  --tt-bg-soft: #201d19;
+  --tt-fg: #e6e0d4;
+  --tt-fg-soft: #cabfa9;
+  --tt-dim: #8a8378;
+  --tt-faint: #5b5650;
+  --tt-border: #3a352d;
+  --tt-border-soft: #2a2622;
+
+  /* ANSI roles */
+  --ansi-red: #e26d5c;
+  --ansi-orange: #e08a3c;
+  --ansi-yellow: #e6c466;
+  --ansi-green: #7ec27a;
+  --ansi-cyan: #6bd6c8;
+  --ansi-blue: #6b9fe3;
+  --ansi-magenta: #c98ad6;
+  --ansi-white: #f0ead8;
+
+  --mono: "JetBrains Mono", "Cascadia Mono", "SF Mono", "Menlo", ui-monospace, monospace;
+  --hand: "Caveat", "Comic Sans MS", cursive;
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-feature-settings: "ss01", "cv02";
+}
+
+/* Subtle drafting grid behind the canvas — handled by design_canvas itself,
+   we just keep body bg neutral. */
+
+/* ====== Cover / header (top of page) ====== */
+.cover {
+  padding: 56px 64px 28px;
+  max-width: 1400px;
+}
+.cover .eyebrow {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+.cover h1 {
+  font-family: var(--mono);
+  font-size: 44px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 8px 0 6px;
+  color: var(--ink);
+}
+.cover h1 .accent { color: var(--accent); }
+.cover .sub {
+  font-family: var(--sans);
+  font-size: 16px;
+  color: var(--ink-dim);
+  max-width: 760px;
+  line-height: 1.55;
+}
+.cover .legend {
+  display: flex;
+  gap: 22px;
+  margin-top: 24px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  letter-spacing: 0.04em;
+  flex-wrap: wrap;
+}
+.cover .legend span::before {
+  content: "•";
+  margin-right: 6px;
+  color: var(--accent);
+}
+
+/* ====== Section header overrides in canvas ====== */
+.dc-section-title-wrap, .dc-section-head {
+  font-family: var(--mono) !important;
+}
+
+/* ====== Terminal frame ====== */
+.term {
+  background: var(--tt-bg);
+  color: var(--tt-fg);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.55;
+  border-radius: 6px;
+  border: 1px solid var(--tt-border);
+  overflow: hidden;
+  position: relative;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.04) inset,
+    0 12px 24px -16px rgba(0, 0, 0, 0.5);
+  font-variant-ligatures: none;
+}
+.term.--light {
+  background: #f7f3e9;
+  color: #2a251f;
+  border-color: #d8d1bf;
+}
+.term.--light .tt-dim { color: #6b665b; }
+.term.--light .tt-faint { color: #908a7c; }
+.term.--light .tt-border { color: #c8bfa9; }
+
+/* Title bar (mock terminal chrome) */
+.term-chrome {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: linear-gradient(180deg, #2a2622 0%, #1f1c18 100%);
+  border-bottom: 1px solid var(--tt-border);
+  font-size: 11px;
+  color: var(--tt-dim);
+}
+.term.--light .term-chrome {
+  background: linear-gradient(180deg, #e6dec8 0%, #d8d1bf 100%);
+  border-bottom-color: #c8bfa9;
+  color: #6b665b;
+}
+.term-chrome .dots {
+  display: inline-flex;
+  gap: 6px;
+}
+.term-chrome .dots i {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #4a443c;
+  display: block;
+}
+.term-chrome .dots i:nth-child(1) { background: #e26d5c; }
+.term-chrome .dots i:nth-child(2) { background: #e6c466; }
+.term-chrome .dots i:nth-child(3) { background: #7ec27a; }
+.term-chrome .title {
+  font-family: var(--mono);
+  letter-spacing: 0.04em;
+}
+.term-chrome .meta {
+  margin-left: auto;
+  font-family: var(--mono);
+}
+
+.term-body {
+  padding: 10px 14px 12px;
+  white-space: pre;
+  overflow: hidden;
+}
+.term-body.--padless { padding: 0; }
+
+/* Span colors (used by Span helpers) */
+.c-red { color: var(--ansi-red); }
+.c-orange { color: var(--ansi-orange); }
+.c-yellow { color: var(--ansi-yellow); }
+.c-green { color: var(--ansi-green); }
+.c-cyan { color: var(--ansi-cyan); }
+.c-blue { color: var(--ansi-blue); }
+.c-magenta { color: var(--ansi-magenta); }
+.c-white { color: var(--ansi-white); }
+.c-fg { color: var(--tt-fg); }
+.c-fg-soft { color: var(--tt-fg-soft); }
+.c-dim { color: var(--tt-dim); }
+.c-faint { color: var(--tt-faint); }
+.c-border { color: var(--tt-border); }
+.c-border-soft { color: var(--tt-border-soft); }
+.b { font-weight: 700; }
+.i { font-style: italic; }
+.u { text-decoration: underline; }
+.strike { text-decoration: line-through; opacity: 0.6; }
+
+/* Block chips — bg + fg reverse */
+.chip {
+  display: inline;
+  padding: 0 0; /* monospace alignment — keep zero, rely on spaces inside */
+  background: transparent;
+  color: inherit;
+}
+.chip-rec { background: var(--ansi-yellow); color: #1a1814; font-weight: 700; }
+.chip-think { background: var(--ansi-green); color: #14201a; font-weight: 700; }
+.chip-recog { background: var(--ansi-cyan); color: #14201f; font-weight: 700; }
+.chip-polish { background: var(--ansi-magenta); color: #1f1424; font-weight: 700; }
+.chip-err { background: var(--ansi-red); color: #f4ebd8; font-weight: 700; }
+.chip-warn { background: var(--ansi-yellow); color: #1a1814; font-weight: 700; }
+.chip-ok { background: var(--ansi-cyan); color: #14201f; font-weight: 700; }
+.chip-ws { background: var(--ansi-yellow); color: #1a1814; font-weight: 700; }
+.chip-flash { background: var(--ansi-magenta); color: #1f1424; font-weight: 700; }
+.chip-key {
+  background: #2f2b25;
+  color: var(--tt-fg);
+  font-weight: 700;
+  padding: 0 1ch;
+}
+.term.--light .chip-key {
+  background: #d8d1bf;
+  color: #2a251f;
+}
+
+/* Caret blink */
+.caret {
+  display: inline-block;
+  width: 1ch;
+  background: var(--tt-fg);
+  color: var(--tt-bg);
+  animation: blink 1s steps(2, start) infinite;
+}
+@keyframes blink { to { visibility: hidden; } }
+
+/* Sparkline / mini bar — drawn inline as monospace */
+.sparkline { letter-spacing: 0; }
+
+/* Caption under each artboard */
+.cap {
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--ink-dim);
+  margin: 14px 4px 0;
+  max-width: 60ch;
+  line-height: 1.5;
+}
+.cap b { color: var(--ink); font-weight: 600; }
+.cap .pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(201, 100, 66, 0.12);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 11px;
+  margin-right: 6px;
+  letter-spacing: 0.04em;
+}
+
+/* Handwritten margin annotations */
+.note {
+  position: absolute;
+  font-family: var(--hand);
+  font-size: 22px;
+  color: var(--accent);
+  line-height: 1.1;
+  transform: rotate(-2deg);
+  pointer-events: none;
+  max-width: 220px;
+}
+.note.--blue { color: #2d6f8f; transform: rotate(1.5deg); }
+.note.--ink { color: var(--ink); transform: rotate(-1deg); }
+.note .arrow {
+  display: block;
+  font-family: var(--hand);
+  font-size: 28px;
+  line-height: 1;
+}
+
+/* Variant divider in section subtitle */
+.dim { color: var(--ink-dim); }
+
+/* For artboards, give body a soft paper-edge inner shadow */
+.dc-artboard { background: transparent !important; }
+
+/* Each variation wrapper: paper card */
+.proto {
+  padding: 28px;
+  background: #f4efe3;
+  border: 1px solid rgba(42, 37, 31, 0.1);
+  border-radius: 4px;
+  position: relative;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.6) inset, 0 18px 30px -22px rgba(42,37,31,0.18);
+}
+.proto .label-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  gap: 16px;
+}
+.proto .label-row h3 {
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: 0.01em;
+}
+.proto .label-row .meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.proto .stack {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.proto .row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 22px;
+}
+.proto .row.--narrow-wide {
+  grid-template-columns: 0.62fr 1fr;
+}
+
+/* Section number stamp */
+.stamp {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--ink);
+  color: var(--ink);
+  letter-spacing: 0.18em;
+  background: var(--paper);
+}
+
+/* utility for inline ASCII row sizing */
+.term-body code {
+  font-family: inherit;
+  font-size: inherit;
+  white-space: pre;
+}

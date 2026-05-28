@@ -108,6 +108,12 @@ OnPartial = Callable[[str, str], Awaitable[None]]  # (text, stable_text)
 def get_asr(sample_rate: int, on_partial: OnPartial) -> AsrSession:
     from ..config import settings
     if settings.asr.provider == "dashscope":
+        # Two cloud models, two different WS protocols — route by name.
+        # qwen3-asr-* uses the OpenAI-Realtime endpoint; paraformer/others
+        # use the run-task inference endpoint.
+        if settings.dashscope.asr_model.startswith("qwen"):
+            from .asr import DashscopeQwenRealtimeAsr
+            return DashscopeQwenRealtimeAsr(sample_rate, on_partial)
         from .asr import DashscopeRealtimeAsr
         return DashscopeRealtimeAsr(sample_rate, on_partial)
     from .asr import MlxStreamingAsr

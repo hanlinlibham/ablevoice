@@ -77,9 +77,12 @@ class DashscopeConfig:
     base_url: str          # OpenAI-compat /chat/completions base
     asr_model: str         # "paraformer-realtime-v2" (default) or "qwen3-asr-flash-realtime" (newer LLM-style ASR, supports natural-language hotword context)
     asr_lang: str          # "zh" — sent as language_hints[0]
-    asr_ws_url: str
+    asr_ws_url: str        # paraformer run-task endpoint (/api-ws/v1/inference/)
+    asr_realtime_ws_url: str  # qwen3-asr OpenAI-Realtime endpoint (/api-ws/v1/realtime)
     asr_vocabulary_id: str # paraformer custom hotword vocabulary id (empty = no biasing). Manage via scripts/manage_vocabulary.py. Ignored by qwen3-asr-flash-realtime.
     asr_context: str       # qwen3-asr-flash-realtime "Technical terms: ..." prompt (empty = none). Ignored by paraformer-realtime-v2. Use one or the other based on asr_model.
+    asr_realtime_vad: bool # qwen3-asr realtime: True=server_vad (streams partials + transcribes during speech), False=manual (one transcript after stop, no partials)
+    asr_realtime_silence_ms: int  # server_vad silence_duration_ms — how long a pause before VAD ends a turn
     chat_model: str        # "qwen3.7-max"
     chat_thinking: bool    # leave off for voice (kills first-audio latency)
     tts_model: str         # realtime: "qwen3-tts-flash-realtime" / "qwen3-tts-instruct-flash-realtime"; http: "qwen3-tts-instruct-flash"
@@ -341,8 +344,14 @@ def _load() -> Settings:
                 "DASHSCOPE_ASR_WS_URL",
                 "wss://dashscope.aliyuncs.com/api-ws/v1/inference/",
             ),
+            asr_realtime_ws_url=_env_str(
+                "DASHSCOPE_ASR_REALTIME_WS_URL",
+                "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+            ),
             asr_vocabulary_id=_env_str("DASHSCOPE_ASR_VOCABULARY_ID", ""),
             asr_context=_env_str("DASHSCOPE_ASR_CONTEXT", ""),
+            asr_realtime_vad=_env_bool("DASHSCOPE_ASR_REALTIME_VAD", True),
+            asr_realtime_silence_ms=_env_int("DASHSCOPE_ASR_REALTIME_SILENCE_MS", 800),
             chat_model=_env_str("DASHSCOPE_MODEL", "qwen3.7-max"),
             chat_thinking=_env_bool("DASHSCOPE_THINKING", False),
             tts_model=_env_str("DASHSCOPE_TTS_MODEL", "qwen3-tts-flash-realtime"),
@@ -600,3 +609,69 @@ def public_view() -> dict:
 settings: Settings = _load()
 _validate(settings)
 _log_summary(settings)
+
+
+# --- Runtime preset switching ----------------------------------------------
+# The UI flips the whole provider stack at runtime (no restart) by applying
+# a named preset. We mutate the live (frozen) sub-config objects IN PLACE via
+# object.__setattr__ so every module that imported the ``settings`` singleton
+# sees the change — the one sanctioned runtime mutation of the otherwise
+# frozen Settings. Single-user localhost probe, so a global switch (not
+# per-session) is fine.
+
+PRESETS: dict[str, dict[str, dict[str, object]]] = {
+    # local ASR + cloud qwen-flash LLM + cloud TTS — lowest latency
+    "fast": {
+        "asr":       {"provider": "mlx", "mlx_model": "Qwen/Qwen3-ASR-0.6B"},
+        "llm":       {"provider": "dashscope"},
+        "dashscope": {"chat_model": "qwen-flash"},
+        "tts":       {"provider": "dashscope"},
+    },
+    # full cloud + ablework agent (RAG / tools / workspace ops)
+    "cloud": {
+        "asr":       {"provider": "dashscope"},
+        "dashscope": {"asr_model": "paraformer-realtime-v2"},
+        "llm":       {"provider": "ablework"},
+        "tts":       {"provider": "dashscope"},
+    },
+    # fully offline — everything MLX (no network; first LLM token is slow)
+    "local": {
+        "asr":       {"provider": "mlx", "mlx_model": "Qwen/Qwen3-ASR-0.6B"},
+        "llm":       {"provider": "mlx"},
+        "tts":       {"provider": "mlx"},
+    },
+}
+
+PRESET_LABELS: dict[str, str] = {
+    "fast":  "快速 · 本地ASR+云qwen-flash",
+    "cloud": "全云端 · ablework agent",
+    "local": "全本地 · 离线MLX",
+}
+
+active_preset: Optional[str] = None  # None = whatever .env.local set at boot
+
+
+def apply_preset(name: str) -> str:
+    """Switch the whole provider stack at runtime. Mutates the live frozen
+    sub-configs in place. Returns the applied name; raises KeyError on an
+    unknown preset (caller reports an error event)."""
+    global active_preset
+    preset = PRESETS[name]
+    for section, fields in preset.items():
+        target = getattr(settings, section)
+        for field_name, value in fields.items():
+            object.__setattr__(target, field_name, value)
+    active_preset = name
+    logger.info("preset applied: %s → asr=%s llm=%s tts=%s",
+                name, settings.asr.provider, settings.llm.provider, settings.tts.provider)
+    return name
+
+
+def current_preset() -> Optional[str]:
+    """Name of the last-applied preset, or None if still on boot config."""
+    return active_preset
+
+
+def preset_options() -> list[dict]:
+    """[{name, label}] for the client preset selector."""
+    return [{"name": k, "label": PRESET_LABELS.get(k, k)} for k in PRESETS]
