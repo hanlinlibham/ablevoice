@@ -27,3 +27,7 @@ docs/done/
 
 # Logs
 *.log
+
+# 设计探索产物(mockup/截图/zip)+ 工具状态 — 不进 git
+tui-terminal*
+.omx/
