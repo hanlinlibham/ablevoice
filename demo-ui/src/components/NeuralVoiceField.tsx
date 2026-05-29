@@ -11,6 +11,7 @@ export type NeuralVoicePhase =
 
 export type NeuralSemanticSource = "user" | "assistant" | "system" | "ontology" | "audio";
 export type NeuralSemanticRoute = "ontology" | "fact" | "evidence" | "memory" | "review" | "discard";
+export type NeuralOperationState = "query" | "modify" | "delete";
 export type NeuralSemanticKind =
   | "concept"
   | "entity"
@@ -28,6 +29,7 @@ export type NeuralSemanticSignal = {
   strength?: number;
   route?: NeuralSemanticRoute;
   kind?: NeuralSemanticKind;
+  operation?: NeuralOperationState;
 };
 
 export type NeuralVoiceApiState = {
@@ -43,6 +45,9 @@ export type NeuralVoiceApiState = {
   workspaceActive?: boolean;
   phase?: NeuralVoicePhase;
   semanticSignal?: NeuralSemanticSignal | null;
+  visualIntensity?: number;
+  coalescing?: boolean;
+  operation?: NeuralOperationState | null;
 };
 
 type NeuralVoiceFieldProps = {
@@ -84,6 +89,7 @@ type Edge = {
   strength: number;
   highway: boolean;
   lane: number;
+  operation: NeuralOperationState | null;
 };
 
 type Topology = {
@@ -107,9 +113,15 @@ type Point = {
   size: number;
   alpha: number;
   energy: number;
+  bodyPulse: number;
   contact: boolean;
   semantic: number;
   flash: number;
+};
+
+type CardiacRhythm = {
+  phase: number;
+  beat: number;
 };
 
 type SemanticActivation = {
@@ -123,6 +135,7 @@ type SemanticActivation = {
   kindIndex: number;
   channels: number[];
   strength: number;
+  operation: NeuralOperationState | null;
 };
 
 const PARTICLE_COUNT = 96;
@@ -145,6 +158,11 @@ const ROUTE_COLORS: Record<NeuralSemanticRoute, Rgb> = {
   memory: [244, 114, 182],
   review: [245, 158, 11],
   discard: [120, 126, 142],
+};
+const OPERATION_COLORS: Record<NeuralOperationState, Rgb> = {
+  query: [230, 196, 102],
+  modify: [201, 100, 66],
+  delete: [212, 92, 92],
 };
 const CREAM: Rgb = [230, 224, 212];
 
@@ -257,6 +275,67 @@ function fract(value: number): number {
   return value - Math.floor(value);
 }
 
+function pulseCurve(phase: number, center: number, width: number): number {
+  const distance = Math.abs(phase - center);
+  return Math.exp(-(distance * distance) / (2 * width * width));
+}
+
+function cardiacRhythm(time: number, activity: number, coalescing: boolean): CardiacRhythm {
+  const rate = mix(0.76, 1.22, activity) + (coalescing ? 0.16 : 0);
+  const phase = fract(time * rate);
+  const firstBeat = pulseCurve(phase, 0.08, 0.022);
+  const secondBeat = pulseCurve(phase, 0.2, 0.038) * 0.58;
+  return {
+    phase,
+    beat: clamp(firstBeat + secondBeat),
+  };
+}
+
+function breathScale(time: number, phase: NeuralVoicePhase, activity: number, visual: number): number {
+  const rate =
+    phase === "offline" ? 0.1 :
+    phase === "idle" ? 0.18 :
+    phase === "listening" ? 0.28 :
+    phase === "thinking" ? 0.16 :
+    phase === "speaking" ? 0.24 :
+    phase === "polishing" ? 0.2 :
+    0.32;
+  const amplitude =
+    phase === "offline" ? 0.012 :
+    phase === "idle" ? 0.025 :
+    phase === "listening" ? 0.048 :
+    phase === "thinking" ? 0.022 :
+    phase === "speaking" ? 0.04 :
+    0.034;
+  return Math.sin(time * TAU * rate) * amplitude * (0.62 + activity * 0.44 + visual * 0.28);
+}
+
+function voiceEnvelope(state: NeuralVoiceApiState, phase: NeuralVoicePhase, time: number): number {
+  const liveInput = Math.max(clamp(state.level * 8), clamp(state.peak * 2.4));
+  const simulated =
+    phase === "listening" ?
+      0.34 + 0.58 *
+      (0.5 + 0.5 * Math.sin(time * 4.2)) *
+      (0.55 + 0.45 * Math.sin(time * 12.6 + 1.1)) :
+    phase === "speaking" ?
+      0.24 + 0.42 *
+      (0.5 + 0.5 * Math.sin(time * 7.2)) *
+      (0.6 + 0.4 * Math.sin(time * 18.6 + 0.7)) :
+    phase === "thinking" || phase === "polishing" ?
+      0.2 + 0.08 * Math.sin(time * 2.1) :
+      0.045 + 0.025 * Math.sin(time * 1.1);
+  return clamp(Math.max(liveInput, simulated));
+}
+
+function outwardPulse(orbit: number, rhythm: CardiacRhythm, activity: number): number {
+  const front = (rhythm.phase - 0.045) / 0.72;
+  if (front < 0 || front > 1.08) return 0;
+  const width = 0.07 + activity * 0.035;
+  const distance = Math.abs(orbit - front);
+  const decay = clamp(1 - rhythm.phase * 0.72);
+  return clamp(Math.exp(-(distance * distance) / (2 * width * width)) * decay * (0.32 + activity * 0.68));
+}
+
 function rgba(rgb: Rgb, alpha: number): string {
   return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${clamp(alpha)})`;
 }
@@ -302,6 +381,17 @@ function buildParticles(): Particle[] {
   });
 }
 
+function edgeOperation(a: number, b: number, lane: number): NeuralOperationState | null {
+  if (lane === 0 || lane === 9) return "query";
+  if (lane === 5 || lane === 14) return "modify";
+  if (lane === 21) return "delete";
+  const roll = (a * 37 + b * 53 + lane * 11) % 100;
+  if (roll < 4) return "query";
+  if (roll < 7) return "modify";
+  if (roll < 9) return "delete";
+  return null;
+}
+
 function buildTopology(): Topology {
   const particles = buildParticles();
   const seen = new Set<string>();
@@ -332,7 +422,9 @@ function buildTopology(): Topology {
         strength: clamp(1 - neighbor.distance / 0.5, 0.18, 1),
         highway: particles[a].contact || particles[b].contact || edges.length % 13 === 0,
         lane: (a * 31 + b * 17 + edges.length * 7) % 29,
+        operation: null,
       };
+      edge.operation = edgeOperation(a, b, edge.lane);
       edges.push(edge);
       adjacency[a].push(edgeIndex);
       adjacency[b].push(edgeIndex);
@@ -360,6 +452,13 @@ function inferSemanticRoute(text: string, kind: NeuralSemanticKind): NeuralSeman
   if (kind === "evidence") return "evidence";
   if (kind === "preference" || /(记住|以后|偏好|history|memory)/i.test(text)) return "memory";
   return "ontology";
+}
+
+function inferOperation(text: string): NeuralOperationState | null {
+  if (/(删除|移除|清除|清空|撤掉|discard|drop|remove|delete)/i.test(text)) return "delete";
+  if (/(修改|更新|编辑|改成|写入|保存|替换|应用|patch|update|edit|modify|write|save|apply)/i.test(text)) return "modify";
+  if (/(查询|搜索|查找|查一下|检索|读取|看看|分析|总结|search|query|lookup|find|fetch|read|inspect|analyze)/i.test(text)) return "query";
+  return null;
 }
 
 function buildSemanticActivation(signal: NeuralSemanticSignal, startedAt: number): SemanticActivation {
@@ -395,6 +494,7 @@ function buildSemanticActivation(signal: NeuralSemanticSignal, startedAt: number
     kindIndex: safeKindIndex,
     channels,
     strength: clamp(signal.strength ?? 1, 0.16, 1.25),
+    operation: signal.operation ?? inferOperation(text),
   };
 }
 
@@ -433,6 +533,7 @@ function phaseFromApiState(state: NeuralVoiceApiState): NeuralVoicePhase {
 function stateActivity(state: NeuralVoiceApiState, phase: NeuralVoicePhase): number {
   const mic = clamp(state.level * 7.5);
   const peak = clamp(state.peak * 3.5);
+  const visual = clamp(state.visualIntensity ?? 0);
   const latency = state.latencyMs ? clamp(1 - state.latencyMs / 1800, 0.12, 1) : 0.38;
   const base =
     phase === "idle" ? 0.28 :
@@ -442,7 +543,7 @@ function stateActivity(state: NeuralVoiceApiState, phase: NeuralVoicePhase): num
     phase === "speaking" ? 0.86 :
     phase === "polishing" ? 0.7 :
     0.62 + latency * 0.28;
-  return clamp(base + peak * 0.18 + (state.workspaceActive ? 0.08 : 0), 0, 1);
+  return clamp(base + peak * 0.18 + visual * 0.36 + (state.coalescing ? 0.22 : 0) + (state.workspaceActive ? 0.08 : 0), 0, 1);
 }
 
 function projectParticle(
@@ -462,12 +563,25 @@ function projectParticle(
   const centerX = width * 0.5 + Math.sin(time * 0.17) * minDim * 0.018;
   const centerY = height * 0.52 + Math.cos(time * 0.13) * minDim * 0.014;
   const mic = clamp(state.level * 8);
-  const breathe = Math.sin(time * (phase === "idle" ? 1.1 : 2.2) + particle.seed) * 0.045;
-  const angle = particle.angle + time * particle.speed * palette.motion;
+  const visual = clamp(state.visualIntensity ?? 0);
+  const coalescing = Boolean(state.coalescing);
+  const activatedCloud = visual > 0 && visual < 0.75 && !coalescing;
+  const focusedCloud = visual >= 0.75 && !coalescing;
+  const rhythm = cardiacRhythm(time, activity, coalescing);
+  const breath = breathScale(time, phase, activity, visual);
+  const envelope = voiceEnvelope(state, phase, time);
+  const pulseWave = outwardPulse(particle.orbit, rhythm, activity);
+  const feedbackSpeed = 1 + visual * 1.85 + (coalescing ? 0.34 : 0);
+  const breathe = Math.sin(time * (phase === "idle" ? 1.1 : 2.2) * feedbackSpeed + particle.seed) * (0.045 + visual * 0.052);
+  const angle = particle.angle + time * particle.speed * palette.motion * feedbackSpeed;
   const base = minDim * (0.25 + palette.coreScale * 0.09);
   const stretchX = 1.5;
   const stretchY = 0.96;
-  let radius = base * (0.58 + particle.orbit * 1.08 + breathe);
+  const visualRadiusScale = activatedCloud ? 1.08 : focusedCloud ? 0.86 : 1;
+  const cardiacContraction = rhythm.beat * (0.028 + activity * 0.038 + (coalescing ? 0.035 : 0));
+  const pulseExpansion = pulseWave * (0.03 + envelope * 0.035);
+  const bodyScale = 1 + breath - cardiacContraction + pulseExpansion;
+  let radius = base * (0.58 + particle.orbit * 1.08 + breathe) * visualRadiusScale * bodyScale;
   let x = centerX + Math.cos(angle) * radius * stretchX;
   let y = centerY + Math.sin(angle) * radius * stretchY;
   let alpha = palette.nodeAlpha * mix(0.58, 1, particle.orbit);
@@ -479,22 +593,23 @@ function projectParticle(
     y = centerY + Math.sin(particle.angle) * radius * 0.52;
     alpha *= 0.55;
   } else if (phase === "listening") {
-    radius = base * (0.54 + particle.orbit * 1.08 + mic * 0.18);
-    const neuralFold = Math.sin(angle * 3 + time * 2.4 + particle.seed) * (7 + mic * 18);
-    x = centerX + Math.cos(angle) * radius * stretchX * (0.76 + mic * 0.24) + neuralFold;
+    const livePush = Math.max(mic, envelope);
+    radius = base * (0.54 + particle.orbit * 1.08 + livePush * 0.18) * bodyScale;
+    const neuralFold = Math.sin(angle * 3 + time * 2.4 + particle.seed) * (7 + livePush * 18);
+    x = centerX + Math.cos(angle) * radius * stretchX * (0.76 + livePush * 0.24) + neuralFold;
     y =
       centerY +
-      Math.sin(angle * 1.08) * radius * stretchY * (0.92 + mic * 0.42) +
-      Math.sin(time * 5.8 + particle.seed) * mic * 15;
+      Math.sin(angle * 1.08) * radius * stretchY * (0.92 + livePush * 0.42) +
+      Math.sin(time * 5.8 + particle.seed) * livePush * 15;
     alpha *= 0.82 + activity * 0.28;
   } else if (phase === "polishing") {
-    const spiralRadius = base * (0.22 + particle.orbit * 1.18);
+    const spiralRadius = base * (0.22 + particle.orbit * 1.18) * bodyScale;
     const spiralAngle = particle.angle + particle.orbit * 4.9 + time * (0.58 + particle.layer * 0.08);
     x = centerX + Math.cos(spiralAngle) * spiralRadius * stretchX * 0.98;
     y = centerY + Math.sin(spiralAngle) * spiralRadius * stretchY * 0.72;
     alpha *= 0.74 + activity * 0.22;
   } else if (phase === "thinking") {
-    radius = base * (0.58 + particle.orbit * 1.25);
+    radius = base * (0.58 + particle.orbit * 1.25) * bodyScale;
     x =
       centerX +
       Math.cos(angle + Math.sin(time * 0.35 + particle.seed) * 0.7) * radius * stretchX +
@@ -505,14 +620,14 @@ function projectParticle(
       Math.cos(time * 0.62 + particle.seed) * minDim * 0.045;
     alpha *= 0.72 + activity * 0.24;
   } else if (phase === "speaking") {
-    const wave = Math.sin(time * 5.2 + particle.angle * 5.8) * (0.045 + activity * 0.12);
+    const wave = Math.sin(time * 5.2 + particle.angle * 5.8) * (0.045 + activity * 0.12 + envelope * 0.04);
     radius = base * (0.52 + particle.orbit * 1.12 + wave);
-    x = centerX + Math.cos(angle) * radius * stretchX * (1.05 + activity * 0.08);
-    y = centerY + Math.sin(angle) * radius * stretchY * (0.82 + activity * 0.22);
+    x = centerX + Math.cos(angle) * radius * stretchX * (1.05 + activity * 0.08 + envelope * 0.06) * bodyScale;
+    y = centerY + Math.sin(angle) * radius * stretchY * (0.82 + activity * 0.22 + envelope * 0.08) * bodyScale;
     alpha *= 0.84 + activity * 0.26;
   } else if (phase === "recovering") {
     const kink = Math.sin(angle * 5 + time * 4.4 + particle.seed) * minDim * 0.035;
-    radius = base * (0.42 + particle.orbit * 0.96);
+    radius = base * (0.42 + particle.orbit * 0.96) * bodyScale;
     x = centerX + Math.cos(angle) * radius * stretchX + kink;
     y = centerY + Math.sin(angle * 0.9) * radius * stretchY - kink * 0.36;
     alpha *= 0.74 + activity * 0.2;
@@ -524,21 +639,40 @@ function projectParticle(
     phase === "thinking" ? 1.08 :
     phase === "speaking" ? 1 + Math.sin(time * 3.2 + particle.seed) * 0.07 + activity * 0.1 :
     phase === "offline" ? 0.42 :
-    0.98 + Math.sin(time * 1.25 + particle.seed) * 0.04;
+    0.98 + Math.sin(time * (1.25 + visual * 0.9) + particle.seed) * (0.04 + visual * 0.025);
   const anchorX =
     centerX +
-    particle.anchorX * width * 0.46 * anchorBreath +
-    Math.sin(time * particle.speed + particle.seed) * drift;
+    particle.anchorX * width * 0.46 * anchorBreath * visualRadiusScale * bodyScale +
+    Math.sin(time * particle.speed * feedbackSpeed + particle.seed) * drift * (1 + visual * 0.5);
   const anchorY =
     centerY +
-    particle.anchorY * height * 0.44 * anchorBreath +
-    Math.cos(time * particle.speed * 1.17 + particle.seed * 1.3) * drift;
+    particle.anchorY * height * 0.44 * anchorBreath * visualRadiusScale * bodyScale +
+    Math.cos(time * particle.speed * 1.17 * feedbackSpeed + particle.seed * 1.3) * drift * (1 + visual * 0.5);
   const anchorWeight =
     phase === "polishing" ? 0.5 :
     phase === "offline" ? 0.72 :
     0.8;
   x = mix(x, anchorX, anchorWeight);
   y = mix(y, anchorY, anchorWeight);
+
+  if (visual > 0 && !coalescing) {
+    const dx = x - centerX;
+    const dy = y - centerY;
+    const contraction = focusedCloud ? 0.74 + Math.sin(time * 1.35 + particle.seed) * 0.025 : 1;
+    const expansion = activatedCloud ? 1.1 + Math.sin(time * 2.2 + particle.seed) * 0.04 : 1;
+    const stateScale = contraction * expansion;
+    const tangent = activatedCloud ? 1 : -0.38;
+    const ripple =
+      Math.sin(time * (1.9 + visual * 2.2) + particle.seed + particle.layer) *
+      minDim *
+      (activatedCloud ? 0.024 : 0.012) *
+      visual;
+    const targetX = centerX + dx * stateScale + -dy * 0.055 * tangent * visual + Math.cos(angle + Math.PI / 2) * ripple;
+    const targetY = centerY + dy * stateScale + dx * 0.035 * tangent * visual + Math.sin(angle + Math.PI / 2) * ripple * 0.76;
+    x = mix(x, targetX, focusedCloud ? 0.78 : 0.64);
+    y = mix(y, targetY, focusedCloud ? 0.78 : 0.64);
+    alpha = clamp(alpha + visual * (activatedCloud ? 0.2 : 0.14));
+  }
 
   if (semantic > 0) {
     const routeAngle = activation?.angle ?? angle;
@@ -550,14 +684,27 @@ function projectParticle(
     y += Math.sin(routeAngle) * stretch * 0.72 * direction + Math.sin(routeAngle + Math.PI / 2) * curl * 0.7;
     alpha = clamp(alpha + semantic * 0.42);
   }
+  if (coalescing) {
+    const sourceAngle = Math.atan2(particle.anchorY, particle.anchorX || 0.0001);
+    const compactAngle = sourceAngle + Math.sin(time * 0.28 + particle.seed) * 0.035;
+    const compactBreath = 1 + Math.sin(time * 1.15 + particle.seed) * 0.024 + breath * 0.8 - rhythm.beat * 0.065 + pulseWave * 0.055;
+    const compactRadius = minDim * (0.045 + Math.pow(particle.orbit, 0.82) * 0.29) * compactBreath;
+    const laneJitter = Math.sin(time * 0.72 + particle.seed * 1.3) * minDim * 0.01;
+    const targetX = centerX + Math.cos(compactAngle) * (compactRadius * 1.1 + laneJitter);
+    const targetY = centerY + Math.sin(compactAngle) * (compactRadius * 0.92 + laneJitter * 0.6);
+    x = mix(x, targetX, 0.9);
+    y = mix(y, targetY, 0.9);
+    alpha = clamp(alpha + 0.14);
+  }
   alpha = clamp(alpha + flash * 0.34);
 
   return {
     x,
     y,
-    size: particle.size * (0.86 + activity * 0.32 + (particle.contact ? 0.22 : 0) + semantic * 0.75 + flash * 0.85),
-    alpha: clamp(alpha),
-    energy: clamp(activity * 0.7 + particle.orbit * 0.3 + flash * 0.35),
+    size: particle.size * (0.86 + activity * 0.32 + visual * 0.22 + rhythm.beat * 0.18 + pulseWave * 0.38 + (coalescing ? 0.08 : 0) + (particle.contact ? 0.22 : 0) + semantic * 0.75 + flash * 0.85),
+    alpha: clamp(alpha + rhythm.beat * 0.08 + pulseWave * 0.12),
+    energy: clamp(activity * 0.7 + particle.orbit * 0.3 + rhythm.beat * 0.28 + pulseWave * 0.44 + flash * 0.35),
+    bodyPulse: clamp(rhythm.beat * 0.42 + pulseWave),
     contact: particle.contact,
     semantic,
     flash,
@@ -664,8 +811,11 @@ function drawLinks(
   palette: Palette,
   activity: number,
   activation: SemanticActivation | null,
+  time: number,
+  apiOperation?: NeuralOperationState | null,
 ): void {
   const routeColor = activation ? ROUTE_COLORS[activation.route] : palette.current;
+  const activeOperation = activation?.operation ?? apiOperation ?? null;
   ctx.save();
   ctx.globalCompositeOperation = "lighter";
   for (const edge of edges) {
@@ -673,14 +823,45 @@ function drawLinks(
     const b = points[edge.b];
     const semanticHighway = activation && (a.semantic > 0.12 || b.semantic > 0.12) && (edge.lane + activation.hash) % 3 !== 0;
     const highway = semanticHighway || (edge.highway && activity > 0.18);
-    const alpha = edge.strength * palette.linkAlpha * (highway ? 1.42 : 0.84) * mix(0.78, 1.18, activity);
+    const bodyPulse = Math.max(a.bodyPulse, b.bodyPulse);
+    const operationMatch = Boolean(activeOperation && edge.operation === activeOperation);
+    const operationFlicker = edge.operation ? clamp((Math.sin(time * 0.86 + edge.lane * 1.91) - 0.56) / 0.44) : 0;
+    const operationLife = operationMatch
+      ? 0.92 + bodyPulse * 0.34
+      : edge.operation
+        ? 0.62 + operationFlicker * (0.28 + bodyPulse * 0.18)
+        : 0;
+    const operationColor = edge.operation ? OPERATION_COLORS[edge.operation] : null;
+    const strokeRgb =
+      operationColor && operationLife > 0.02
+        ? operationColor
+        : semanticHighway ? routeColor : highway ? palette.current : palette.primary;
+    const alpha =
+      edge.strength * palette.linkAlpha * (highway ? 1.42 : 0.84) * mix(0.78, 1.18, activity) +
+      bodyPulse * 0.09 +
+      operationLife * (operationMatch ? 0.46 : 0.34);
 
-    ctx.lineWidth = highway ? 0.85 + activity * 0.42 : 0.48;
-    ctx.strokeStyle = rgba(semanticHighway ? routeColor : highway ? palette.current : palette.primary, alpha + (semanticHighway ? 0.16 : 0));
+    ctx.lineWidth = (highway ? 0.85 + activity * 0.42 : 0.48) + bodyPulse * 0.22 + operationLife * 0.8;
+    ctx.strokeStyle = rgba(strokeRgb, alpha + (semanticHighway ? 0.16 : 0));
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(b.x, b.y);
     ctx.stroke();
+
+    if (operationColor && operationLife > 0.02) {
+      ctx.save();
+      ctx.globalCompositeOperation = "source-over";
+      ctx.shadowColor = rgba(operationColor, operationMatch ? 0.9 : 0.72);
+      ctx.shadowBlur = operationMatch ? 15 : 10;
+      ctx.lineCap = "round";
+      ctx.lineWidth = operationMatch ? 2.2 : 1.55;
+      ctx.strokeStyle = rgba(operationColor, operationMatch ? 0.96 : 0.88);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+      ctx.restore();
+    }
   }
   ctx.restore();
 }
@@ -783,10 +964,11 @@ function maybeSpawnAmbientPulse(
   phase: NeuralVoicePhase,
   palette: Palette,
   activity: number,
+  heartbeat = 0,
 ): void {
-  const bursts = phase === "thinking" && Math.random() < 0.22 ? 2 : 1;
+  const bursts = (phase === "thinking" && Math.random() < 0.22 ? 2 : 1) + (heartbeat > 0.35 ? 1 : 0);
   for (let i = 0; i < bursts; i += 1) {
-    if (Math.random() >= phasePulseRate(phase, activity)) continue;
+    if (Math.random() >= phasePulseRate(phase, clamp(activity + heartbeat * 0.32))) continue;
     const edgeIndex = pickPulseEdge(edges, points, width, height, phase);
     if (edgeIndex < 0) continue;
     const edge = edges[edgeIndex];
@@ -799,7 +981,7 @@ function maybeSpawnAmbientPulse(
       edgeIndex,
       choosePulseDirection(edge, points, width, height, phase),
       color,
-      phasePulseSpeed(phase),
+      phasePulseSpeed(phase) * (1 + heartbeat * 0.45),
     );
   }
 }
@@ -887,6 +1069,39 @@ function drawPulses(
   ctx.restore();
 }
 
+function drawOperationLinks(
+  ctx: CanvasRenderingContext2D,
+  points: Point[],
+  edges: Edge[],
+  activation: SemanticActivation | null,
+  apiOperation?: NeuralOperationState | null,
+): void {
+  const activeOperation = activation?.operation ?? apiOperation ?? null;
+  ctx.save();
+  ctx.globalCompositeOperation = "source-over";
+  ctx.lineCap = "round";
+  for (const edge of edges) {
+    if (!edge.operation) continue;
+    const a = points[edge.a];
+    const b = points[edge.b];
+    const color = OPERATION_COLORS[edge.operation];
+    const operationMatch = activeOperation === edge.operation;
+    ctx.shadowColor = rgba(color, operationMatch ? 0.86 : 0.62);
+    ctx.shadowBlur = operationMatch ? 16 : 10;
+    ctx.lineWidth = operationMatch ? 2.4 : 1.7;
+    ctx.strokeStyle = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+    ctx.fillStyle = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+    ctx.beginPath();
+    ctx.arc((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, operationMatch ? 3.1 : 2.2, 0, TAU);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
 function drawNodes(
   ctx: CanvasRenderingContext2D,
   points: Point[],
@@ -905,27 +1120,28 @@ function drawNodes(
     const touch = point.contact && point.energy > 0.22;
     const blink = touch ? 0.18 + Math.max(0, Math.sin(time * 2.8 + i)) * 0.34 : 0;
     const flash = point.flash;
+    const bodyPulse = point.bodyPulse;
 
-    if (touch || point.semantic > 0.16 || flash > 0.08) {
-      ctx.shadowColor = rgba(point.semantic > 0.16 ? routeColor : rgb, 0.34 + activity * 0.18 + point.semantic * 0.18 + flash * 0.16);
-      ctx.shadowBlur = 8 + activity * 8 + point.semantic * 10 + flash * 8;
+    if (touch || point.semantic > 0.16 || flash > 0.08 || bodyPulse > 0.12) {
+      ctx.shadowColor = rgba(point.semantic > 0.16 ? routeColor : rgb, 0.34 + activity * 0.18 + point.semantic * 0.18 + flash * 0.16 + bodyPulse * 0.22);
+      ctx.shadowBlur = 8 + activity * 8 + point.semantic * 10 + flash * 8 + bodyPulse * 10;
     } else {
       ctx.shadowBlur = 0;
     }
-    ctx.fillStyle = rgba(rgb, 0.06 + point.semantic * 0.08 + flash * 0.055);
+    ctx.fillStyle = rgba(rgb, 0.06 + point.semantic * 0.08 + flash * 0.055 + bodyPulse * 0.06);
     ctx.beginPath();
-    ctx.arc(point.x, point.y, point.size * (3.2 + point.semantic * 2.2 + flash * 1.4), 0, TAU);
+    ctx.arc(point.x, point.y, point.size * (3.2 + point.semantic * 2.2 + flash * 1.4 + bodyPulse * 1.2), 0, TAU);
     ctx.fill();
-    ctx.fillStyle = rgba(rgb, point.alpha + blink + point.semantic * 0.2 + flash * 0.28);
+    ctx.fillStyle = rgba(rgb, point.alpha + blink + point.semantic * 0.2 + flash * 0.28 + bodyPulse * 0.2);
     ctx.beginPath();
     ctx.arc(point.x, point.y, point.size, 0, TAU);
     ctx.fill();
 
-    if (touch || point.semantic > 0.24 || flash > 0.16) {
+    if (touch || point.semantic > 0.24 || flash > 0.16 || bodyPulse > 0.28) {
       ctx.lineWidth = 0.9;
-      ctx.strokeStyle = rgba(point.semantic > 0.24 ? routeColor : CREAM, 0.28 + activity * 0.42 + point.semantic * 0.22 + flash * 0.36);
+      ctx.strokeStyle = rgba(point.semantic > 0.24 ? routeColor : CREAM, 0.28 + activity * 0.42 + point.semantic * 0.22 + flash * 0.36 + bodyPulse * 0.38);
       ctx.beginPath();
-      ctx.arc(point.x, point.y, point.size * (2.3 + activity * 0.8 + point.semantic + flash * 0.7), 0, TAU);
+      ctx.arc(point.x, point.y, point.size * (2.3 + activity * 0.8 + point.semantic + flash * 0.7 + bodyPulse * 1.1), 0, TAU);
       ctx.stroke();
     }
   }
@@ -942,6 +1158,7 @@ export function NeuralVoiceField({ apiState, className = "", frameless = false }
   const flashesRef = useRef<number[]>([]);
   const topology = useMemo(() => buildTopology(), []);
   const { particles, edges, adjacency } = topology;
+  const operationEdgeCount = useMemo(() => edges.filter((edge) => edge.operation).length, [edges]);
   const phase = phaseFromApiState(apiState);
 
   useEffect(() => {
@@ -1000,6 +1217,7 @@ export function NeuralVoiceField({ apiState, className = "", frameless = false }
       const currentPhase = phaseFromApiState(state);
       const palette = PALETTES[currentPhase];
       const activity = stateActivity(state, currentPhase);
+      const rhythm = cardiacRhythm(time, activity, Boolean(state.coalescing));
       const activation = semanticActivationRef.current;
       let flashes = flashesRef.current;
       if (flashes.length !== particles.length) {
@@ -1020,12 +1238,13 @@ export function NeuralVoiceField({ apiState, className = "", frameless = false }
         drawBackground(ctx, width, height, palette, activity);
       }
       if (!reducedMotionRef.current) {
-        maybeSpawnAmbientPulse(pulsesRef.current, edges, points, width, height, currentPhase, palette, activity);
+        maybeSpawnAmbientPulse(pulsesRef.current, edges, points, width, height, currentPhase, palette, activity, rhythm.beat);
       }
-      drawLinks(ctx, points, edges, palette, activity, activation);
+      drawLinks(ctx, points, edges, palette, activity, activation, time, state.operation);
       drawPulses(ctx, points, edges, adjacency, pulsesRef.current, flashes, currentPhase, activity);
       drawSemanticPath(ctx, width, height, time, activation);
       drawNodes(ctx, points, time, palette, activity, activation);
+      drawOperationLinks(ctx, points, edges, activation, state.operation);
       for (let i = 0; i < flashes.length; i += 1) {
         flashes[i] *= 0.88;
       }
@@ -1053,6 +1272,7 @@ export function NeuralVoiceField({ apiState, className = "", frameless = false }
         frameless ? "border border-transparent bg-transparent" : `border bg-(--color-bg) ${PHASE_BORDER[phase]}`
       } ${className}`}
       data-phase={phase}
+      data-operation-edges={operationEdgeCount}
     >
       <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" aria-hidden="true" />
       {!frameless && <div className="pointer-events-none absolute inset-0 border border-white/5" />}

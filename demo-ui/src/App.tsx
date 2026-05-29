@@ -15,6 +15,7 @@ import {
   type NeuralSemanticSignal,
   type NeuralVoiceApiState,
 } from "./components/NeuralVoiceField";
+import { NeuralNebula } from "./components/NeuralNebula";
 
 /* --------------------------------------------------------------------------
  * ai-elements-style minimal components.
@@ -666,6 +667,8 @@ export default function App() {
   // call below so ``ws`` is in scope.
   const [recordingStartedAt, setRecordingStartedAt] = useState<number | null>(null);
   const [semanticSignal, setSemanticSignal] = useState<NeuralSemanticSignal | null>(null);
+  const [visualFeedbackLevel, setVisualFeedbackLevel] = useState(0);
+  const [coalescing, setCoalescing] = useState(false);
   const audioQueue = useAudioQueue();
 
   // Per-tab session id; refresh = brand-new conversation.
@@ -739,6 +742,37 @@ export default function App() {
       strength,
     });
   }, []);
+
+  const triggerVisualFeedback = useCallback(() => {
+    const nextLevel = (visualFeedbackLevel + 1) % 3;
+    const labels = ["松散呼吸", "通路激活", "收束聚焦"];
+    setCoalescing(false);
+    setVisualFeedbackLevel(nextLevel);
+    semanticNonceRef.current += 1;
+    setSemanticSignal({
+      nonce: semanticNonceRef.current,
+      text: labels[nextLevel],
+      source: "system",
+      strength: [0.32, 0.72, 0.96][nextLevel],
+      route: "ontology",
+      kind: "concept",
+    });
+  }, [visualFeedbackLevel]);
+
+  const toggleCoalescing = useCallback(() => {
+    const nextCoalescing = !coalescing;
+    setCoalescing(nextCoalescing);
+    setVisualFeedbackLevel(0);
+    semanticNonceRef.current += 1;
+    setSemanticSignal({
+      nonce: semanticNonceRef.current,
+      text: nextCoalescing ? "助手实心聚合收缩" : "助手恢复松散点云",
+      source: "system",
+      strength: nextCoalescing ? 0.42 : 0.3,
+      route: "ontology",
+      kind: "concept",
+    });
+  }, [coalescing]);
 
   const applyConfigSnapshot = useCallback((info: ConfigSnapshot) => {
     setServerInfo({
@@ -986,12 +1020,14 @@ export default function App() {
     polishing,
     chatting,
     playing: audioQueue.playing,
-    level: ws.level,
-    peak: ws.peak,
+    level: Math.max(ws.level, visualFeedbackLevel * 0.035),
+    peak: Math.max(ws.peak, visualFeedbackLevel * 0.12),
     retrying: Boolean(retryBanner),
     latencyMs: latestTranscribeMs,
     workspaceActive: Boolean(currentWs.id),
     semanticSignal,
+    visualIntensity: visualFeedbackLevel / 2,
+    coalescing,
   }), [
     ws.connected,
     ws.recording,
@@ -1004,6 +1040,8 @@ export default function App() {
     latestTranscribeMs,
     currentWs.id,
     semanticSignal,
+    visualFeedbackLevel,
+    coalescing,
   ]);
 
   // Cold-load: hydrate the conversation panel from SQLite (read-only —
@@ -1109,6 +1147,7 @@ export default function App() {
      interrupts (server cancels chat task). */
   const onPressStart = useCallback(() => {
     audioQueue.stop();
+    setCoalescing(false);
     pulseSemantic("voice input", "audio", 0.36);
     void ws.startRecording();
   }, [audioQueue, pulseSemantic, ws]);
@@ -1174,6 +1213,7 @@ export default function App() {
       >
         <div className="relative flex w-full max-w-[820px] flex-col items-center gap-5">
           <div
+            onClick={triggerVisualFeedback}
             className="relative w-full overflow-hidden rounded-[28px]"
             style={{
               background: "rgba(10,10,16,0.72)",
@@ -1181,9 +1221,12 @@ export default function App() {
               WebkitBackdropFilter: "blur(40px) saturate(140%)",
               boxShadow:
                 "0 40px 100px -24px rgba(0,0,0,0.64), inset 0 0 0 1px rgba(255,255,255,0.075), 0 0 72px rgba(107,214,200,0.08)",
+              cursor: "pointer",
             }}
+            aria-label="点云反馈"
+            title="点击点云改变形态和速率"
           >
-            <NeuralVoiceField
+            <NeuralNebula
               apiState={voiceVisualState}
               frameless
               className="h-[60vh] max-h-[500px] min-h-[320px] w-full"
@@ -1201,6 +1244,20 @@ export default function App() {
                 <StopCircle size={18} />
               </button>
             )}
+            <button
+              type="button"
+              onClick={toggleCoalescing}
+              className={`flex size-10 items-center justify-center rounded-full border transition ${
+                coalescing
+                  ? "border-emerald-300/70 bg-emerald-400/12 text-emerald-200 shadow-[0_0_24px_rgba(52,211,153,0.24)]"
+                  : "border-cyan-400/30 text-cyan-100/75 hover:border-emerald-300/70 hover:text-emerald-200"
+              }`}
+              aria-label="聚合收缩"
+              aria-pressed={coalescing}
+              title="聚合收缩"
+            >
+              <span className="size-3 rounded-full bg-current/35 shadow-[0_0_10px_currentColor]" />
+            </button>
             <button
               type="button"
               onMouseDown={onPressStart}

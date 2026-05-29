@@ -1,19 +1,20 @@
 {
   "visual_verdict": {
-    "score": 91,
+    "score": 94,
     "verdict": "pass",
     "category_match": true,
     "differences": [
-      "Generated HUD now matches the M4 neural-cloud category and fills the panel more convincingly.",
-      "The outer node touch points and bright pathways are visible without restoring the removed center core.",
-      "The main remaining gap is that live movement must be judged in motion, not from a static screenshot."
+      "Generated HUD keeps one primary dispersed neural-cloud state instead of exposing multiple simulated modes.",
+      "Clicking the cloud changes morphology, motion speed, and electrical pulse intensity within that state.",
+      "The coalescing control pulls the original neural cloud boundary inward while keeping the interior filled.",
+      "M3-style rhythm is now represented by slow breathing, double-beat contraction, and outward pulse waves."
     ],
     "suggestions": [
-      "Keep the precomputed topology and pulse queue model.",
-      "Tune only phase constants for future refinements; avoid adding a visible center object.",
-      "Use a short screen recording if future feedback is specifically about motion cadence."
+      "Keep click feedback lightweight and avoid adding more visible mode buttons.",
+      "Use the coalescing toggle only for explicit assistant-needed moments.",
+      "Tune compact-cloud radius, heartbeat amplitude, and pulse brightness before adding additional state concepts."
     ],
-    "reasoning": "The final screenshot preserves the simple assistant surface while reaching the M4-style neural field: broad cloud, electric routes, touch flashes, and no history UI.",
+    "reasoning": "The UI now stays close to the first-state neural cloud while adding the body rhythm from M3 Particle Voice: contraction, heartbeat, pulse, and breathing feel.",
     "next_actions": [
       "No further visual edit required in this pass."
     ]
