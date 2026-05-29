@@ -251,6 +251,27 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class VadConfig:
+    """Local Silero VAD + turn endpointing for hands-free mode. Fully
+    CPU/onnx — no torch, no GPU, runs inline on the event loop (never the
+    MLX worker). ``enabled`` gates the server's ability to honour
+    ``start_handsfree``; the client still chooses per-session whether to
+    use hands-free at all. The endpoint knobs mirror
+    ``voice.vad.EndpointConfig`` (ws.py builds one from these)."""
+    enabled: bool
+    model_path: Path
+    threshold: float          # speech_prob >= this counts as speech
+    onset_ms: int             # sustained speech to confirm a turn start
+    silence_ms: int           # default end-of-turn trailing silence
+    silence_ms_short: int     # tier-2: after terminal punctuation
+    silence_ms_long: int      # tier-2: after a filler / trailing comma
+
+    @property
+    def model_exists(self) -> bool:
+        return self.model_path.exists()
+
+
+@dataclass(frozen=True)
 class Settings:
     """Top-level config bag. ``settings`` (singleton below) is what the
     rest of the code touches."""
@@ -264,6 +285,7 @@ class Settings:
     intent: IntentConfig
     sentence: SentenceConfig
     storage: StorageConfig
+    vad: VadConfig
     warmup: bool
 
     # Convenience accessors — keep call sites readable.
@@ -444,6 +466,17 @@ def _load() -> Settings:
             audio_dir=data_dir / "recordings",
             keep_audio=_env_bool("KEEP_AUDIO", False),
         ),
+        vad=VadConfig(
+            enabled=_env_bool("VAD_ENABLED", True),
+            model_path=Path(_env_str(
+                "VAD_MODEL_PATH", str(data_dir / "models" / "silero_vad.onnx"),
+            )),
+            threshold=_env_float("VAD_THRESHOLD", 0.5),
+            onset_ms=_env_int("VAD_ONSET_MS", 128),
+            silence_ms=_env_int("VAD_SILENCE_MS", 900),
+            silence_ms_short=_env_int("VAD_SILENCE_MS_SHORT", 480),
+            silence_ms_long=_env_int("VAD_SILENCE_MS_LONG", 1500),
+        ),
         warmup=_env_bool("WARMUP", True),
     )
 
@@ -484,6 +517,15 @@ def _validate(s: Settings) -> None:
         raise RuntimeError(f"TTS_PITCH_RATE={s.tts.pitch_rate} not in [0.5, 2.0]")
     if not (0 <= s.tts.volume <= 100):
         raise RuntimeError(f"TTS_VOLUME={s.tts.volume} not in [0, 100]")
+    if not (0.0 <= s.vad.threshold <= 1.0):
+        raise RuntimeError(f"VAD_THRESHOLD={s.vad.threshold} not in [0.0, 1.0]")
+    if s.vad.enabled and not s.vad.model_exists:
+        logger.warning(
+            "VAD_ENABLED=1 but silero model not found at %s — hands-free "
+            "mode will error on start_handsfree. Place silero_vad.onnx there "
+            "or set VAD_MODEL_PATH (push-to-talk is unaffected).",
+            s.vad.model_path,
+        )
 
     needs_dashscope = (
         (s.asr.provider == "dashscope") or
@@ -519,12 +561,15 @@ def _log_summary(s: Settings) -> None:
     tts_tag = s.tts_active_model_id
     if s.tts.provider == "dashscope" and s.dashscope.tts_is_realtime:
         tts_tag += f" [WS mode={s.dashscope.tts_realtime_mode}]"
+    vad_tag = "on" if (s.vad.enabled and s.vad.model_exists) else (
+        "no-model" if s.vad.enabled else "off"
+    )
     logger.info(
-        "config: ASR=%s(%s) LLM=%s(%s) TTS=%s(%s, voice=%s) polish=%s keep_audio=%s warmup=%s",
+        "config: ASR=%s(%s) LLM=%s(%s) TTS=%s(%s, voice=%s) polish=%s vad=%s keep_audio=%s warmup=%s",
         s.asr.provider, s.asr_active_model_id,
         s.llm.provider, s.llm_active_model_id,
         s.tts.provider, tts_tag, s.tts.voice,
-        polish_tag, s.storage.keep_audio, s.warmup,
+        polish_tag, vad_tag, s.storage.keep_audio, s.warmup,
     )
 
 
@@ -598,6 +643,15 @@ def public_view() -> dict:
             "db_path": str(s.storage.db_path),
             "audio_dir": str(s.storage.audio_dir),
             "keep_audio": s.storage.keep_audio,
+        },
+        "vad": {
+            "enabled": s.vad.enabled,
+            "model_path": str(s.vad.model_path),
+            "model_exists": s.vad.model_exists,
+            "threshold": s.vad.threshold,
+            "silence_ms": s.vad.silence_ms,
+            "silence_ms_short": s.vad.silence_ms_short,
+            "silence_ms_long": s.vad.silence_ms_long,
         },
         "warmup": s.warmup,
         "system_prompt_chars": len(s.llm.system_prompt),

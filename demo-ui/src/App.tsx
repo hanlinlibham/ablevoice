@@ -9,6 +9,7 @@ import {
   Send,
   RefreshCw,
   StopCircle,
+  AudioLines,
 } from "lucide-react";
 import {
   NeuralVoiceField,
@@ -322,6 +323,9 @@ type Workspace = {
 };
 
 type Preset = { name: string; label: string };
+/** Hands-free listening state, mirrored from the server's vad_state events.
+ *  null = not in hands-free mode. */
+type VadState = "listening" | "speech" | "endpoint" | null;
 type ConfigSnapshot = {
   asr_provider: string; asr_model_id: string;
   tts_provider: string; tts_model_id: string; tts_voice: string;
@@ -370,6 +374,7 @@ type WSHandlers = {
   }) => void;
   onVoiceSet?: (v: { voice: string | null; provider: string | null }) => void;
   onPolishSet?: (p: { enabled: boolean }) => void;
+  onVadState?: (v: { state: string }) => void;
 };
 
 type HandlerArg<K extends keyof WSHandlers> = Parameters<NonNullable<WSHandlers[K]>>[0];
@@ -387,6 +392,12 @@ type VoiceWS = {
   /** Send a raw JSON event to the server (e.g. set_workspace,
    *  refresh_workspaces, set_polish, set_voice). */
   send: (obj: Record<string, unknown>) => void;
+  /** Hands-free (VAD-driven) listening: mic stays open, the server decides
+   *  turn boundaries. Mutually exclusive with push-to-talk recording. */
+  handsfree: boolean;
+  vadState: VadState;
+  startHandsfree: () => Promise<void>;
+  stopHandsfree: () => void;
 };
 
 function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
@@ -394,6 +405,8 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
   const [recording, setRecording] = useState(false);
   const [level, setLevel] = useState(0);
   const [peak, setPeak] = useState(0);
+  const [handsfree, setHandsfree] = useState(false);
+  const [vadState, setVadState] = useState<VadState>(null);
 
   // Latest handlers, accessed by message handler without re-creating the WS.
   const handlersRef = useRef(handlers);
@@ -473,6 +486,12 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
         case "intent_ack":    h.onIntentAck?.(msg as HandlerArg<"onIntentAck">); break;
         case "voice_set":     h.onVoiceSet?.(msg as HandlerArg<"onVoiceSet">); break;
         case "polish_set":    h.onPolishSet?.(msg as HandlerArg<"onPolishSet">); break;
+        case "vad_state":
+          setVadState((typeof msg.state === "string" ? msg.state : null) as VadState);
+          h.onVadState?.({ state: typeof msg.state === "string" ? msg.state : "" });
+          break;
+        case "handsfree_started": setHandsfree(true); break;
+        case "handsfree_stopped": setHandsfree(false); setVadState(null); break;
         default: console.warn("unknown ws event", msg);
       }
     };
@@ -482,10 +501,9 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
   }, [sessionId]);
 
   // ── recording lifecycle ──────────────────────────────────────────────
-  const stopRecording = useCallback(() => {
-    setRecording(false);
-    // Tear down the audio graph before sending stop_recording so the
-    // mic indicator clears immediately.
+  // Tear down the mic → PCM graph. Shared by push-to-talk stop and
+  // hands-free stop; clears the browser mic indicator immediately.
+  const teardownAudio = useCallback(() => {
     if (analyserRafRef.current !== null) {
       cancelAnimationFrame(analyserRafRef.current);
       analyserRafRef.current = null;
@@ -504,30 +522,32 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
       audioCtxRef.current = null;
     }
     setLevel(0);
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: "stop_recording",
-        peak_level: Number(peakRef.current.toFixed(4)),
-        browser: navigator.userAgent.slice(0, 80),
-      }));
-    }
   }, []);
 
-  const startRecording = useCallback(async () => {
+  // Build the mic → 16kHz int16 PCM → ws pipeline. Shared by push-to-talk
+  // and hands-free. echoCancellation is ESSENTIAL for hands-free: the mic
+  // stays open while TTS plays, so without AEC the assistant's own voice
+  // would trip the server-side VAD and barge in on itself.
+  const setupAudio = useCallback(async (): Promise<boolean> => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       handlersRef.current.onError?.("ws", "WebSocket not connected");
-      return;
+      return false;
     }
-    if (workletNodeRef.current) return;  // already recording
+    if (workletNodeRef.current) return true;  // already streaming
 
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
     } catch (err: unknown) {
       handlersRef.current.onError?.("mic", `getUserMedia failed: ${errorMessage(err)}`);
-      return;
+      return false;
     }
     streamRef.current = stream;
 
@@ -538,7 +558,8 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
     }).webkitAudioContext;
     if (!AudioContextCtor) {
       handlersRef.current.onError?.("mic", "AudioContext unavailable");
-      return;
+      teardownAudio();
+      return false;
     }
     const audioCtx = new AudioContextCtor();
     audioCtxRef.current = audioCtx;
@@ -546,8 +567,8 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
       await audioCtx.audioWorklet.addModule("/pcm-worklet.js");
     } catch (err: unknown) {
       handlersRef.current.onError?.("worklet", `addModule failed: ${errorMessage(err)}`);
-      stopRecording();
-      return;
+      teardownAudio();
+      return false;
     }
 
     const source = audioCtx.createMediaStreamSource(stream);
@@ -587,15 +608,56 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
       analyserRafRef.current = requestAnimationFrame(tick);
     };
     analyserRafRef.current = requestAnimationFrame(tick);
+    return true;
+  }, [teardownAudio]);
 
-    // Tell the server we're about to stream PCM. This also implicitly
-    // interrupts any in-flight chat.
-    ws.send(JSON.stringify({
-      type: "start_recording",
-      sample_rate: 16000,
-    }));
-    setRecording(true);
-  }, [stopRecording]);
+  // ── push-to-talk ──────────────────────────────────────────────────────
+  const stopRecording = useCallback(() => {
+    setRecording(false);
+    teardownAudio();
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "stop_recording",
+        peak_level: Number(peakRef.current.toFixed(4)),
+        browser: navigator.userAgent.slice(0, 80),
+      }));
+    }
+  }, [teardownAudio]);
+
+  const startRecording = useCallback(async () => {
+    const ok = await setupAudio();
+    if (!ok) return;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      // Tell the server we're about to stream PCM. This also implicitly
+      // interrupts any in-flight chat.
+      ws.send(JSON.stringify({ type: "start_recording", sample_rate: 16000 }));
+      setRecording(true);
+    }
+  }, [setupAudio]);
+
+  // ── hands-free (VAD-driven) ─────────────────────────────────────────────
+  const startHandsfree = useCallback(async () => {
+    const ok = await setupAudio();
+    if (!ok) return;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      // Keep the mic open and let the server's VAD decide turn boundaries.
+      ws.send(JSON.stringify({ type: "start_handsfree", sample_rate: 16000 }));
+      setHandsfree(true);
+    }
+  }, [setupAudio]);
+
+  const stopHandsfree = useCallback(() => {
+    setHandsfree(false);
+    setVadState(null);
+    teardownAudio();
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "stop_handsfree" }));
+    }
+  }, [teardownAudio]);
 
   const interrupt = useCallback(() => {
     const ws = wsRef.current;
@@ -625,7 +687,11 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
     }
   }, []);
 
-  return { connected, recording, level, peak, startRecording, stopRecording, interrupt, reset, ttsOneShot, send };
+  return {
+    connected, recording, level, peak, handsfree, vadState,
+    startRecording, stopRecording, startHandsfree, stopHandsfree,
+    interrupt, reset, ttsOneShot, send,
+  };
 }
 
 export default function App() {
@@ -1016,7 +1082,7 @@ export default function App() {
 
   const voiceVisualState = useMemo<NeuralVoiceApiState>(() => ({
     connected: ws.connected,
-    recording: ws.recording,
+    recording: ws.recording || (ws.handsfree && ws.vadState === "speech"),
     polishing,
     chatting,
     playing: audioQueue.playing,
@@ -1031,6 +1097,8 @@ export default function App() {
   }), [
     ws.connected,
     ws.recording,
+    ws.handsfree,
+    ws.vadState,
     ws.level,
     ws.peak,
     polishing,
@@ -1146,6 +1214,7 @@ export default function App() {
      as startRecording resolves. New recording mid-AI-reply implicitly
      interrupts (server cancels chat task). */
   const onPressStart = useCallback(() => {
+    if (ws.handsfree) return;  // push-to-talk disabled while hands-free is on
     audioQueue.stop();
     setCoalescing(false);
     pulseSemantic("voice input", "audio", 0.36);
@@ -1158,7 +1227,7 @@ export default function App() {
 
   /* Keyboard: Space hold = push-to-talk while button is focused. */
   const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.code === "Space" && !ws.recording) {
+    if (e.code === "Space" && !ws.recording && !ws.handsfree) {
       e.preventDefault();
       onPressStart();
     }
@@ -1265,22 +1334,52 @@ export default function App() {
               onMouseLeave={() => { if (ws.recording) onPressEnd(); }}
               onTouchStart={(e) => { e.preventDefault(); onPressStart(); }}
               onTouchEnd={(e) => { e.preventDefault(); onPressEnd(); }}
-              disabled={!ws.connected}
+              disabled={!ws.connected || ws.handsfree}
               className={`flex size-14 items-center justify-center rounded-full border-2 transition ${
                 ws.recording
                   ? "border-amber-400 bg-amber-500/25 text-amber-200 shadow-[0_0_30px_rgba(245,158,11,0.28)]"
-                  : !ws.connected
+                  : !ws.connected || ws.handsfree
                     ? "cursor-not-allowed border-(--color-border) text-(--color-muted) opacity-45"
                     : "border-cyan-400/45 text-cyan-100 hover:border-amber-400 hover:text-amber-200"
               }`}
               aria-label="按住录音"
-              title="按住录音 / Space / ⌘⇧Space"
+              title={ws.handsfree ? "免按键模式下停用(关掉免按键再用)" : "按住录音 / Space / ⌘⇧Space"}
             >
               {ws.recording ? (
                 <Square size={17} className="fill-amber-300 text-amber-300" />
               ) : (
                 <Mic size={20} />
               )}
+            </button>
+            {/* Hands-free toggle — mic stays open, server VAD segments turns. */}
+            <button
+              type="button"
+              onClick={() => {
+                if (ws.handsfree) {
+                  ws.stopHandsfree();
+                } else {
+                  audioQueue.stop();
+                  void ws.startHandsfree();
+                }
+              }}
+              disabled={!ws.connected}
+              className={`flex size-10 items-center justify-center rounded-full border transition ${
+                ws.handsfree
+                  ? "border-emerald-300/70 bg-emerald-400/15 text-emerald-200 shadow-[0_0_24px_rgba(52,211,153,0.28)]"
+                  : !ws.connected
+                    ? "cursor-not-allowed border-(--color-border) text-(--color-muted) opacity-45"
+                    : "border-cyan-400/30 text-cyan-100/75 hover:border-emerald-300/70 hover:text-emerald-200"
+              }`}
+              aria-label="免按键模式"
+              aria-pressed={ws.handsfree}
+              title={ws.handsfree
+                ? `免按键监听中${ws.vadState === "speech" ? "(说话中)" : ""} — 点击关闭`
+                : "免按键:VAD 自动断句,说话即录(点击开启)"}
+            >
+              <AudioLines
+                size={18}
+                className={ws.handsfree && ws.vadState === "speech" ? "animate-pulse" : ""}
+              />
             </button>
             <button
               type="button"

@@ -60,6 +60,7 @@ from .providers import get_asr
 from .providers.base import AsrSession
 from .providers.llm import reset_ablework_session
 from .storage import DraftRecorder
+from .vad import EndpointConfig, EndpointDetector, FrameChunker, SileroVad
 
 logger = logging.getLogger("voice.ws")
 
@@ -97,6 +98,18 @@ class WsSession:
         # refreshed on demand.
         self.workspace_override: Optional[str] = None
         self.cache = WorkspaceCache()
+        # --- hands-free (VAD-driven) listening state -------------------
+        # When ``handsfree`` is on, the client streams PCM continuously and
+        # the server decides turn boundaries via Silero VAD + endpointing,
+        # not the client's explicit start/stop_recording. The vad / chunker
+        # / endpoint trio is built on start_handsfree, torn down on stop.
+        # ``_stable_partial`` is the latest stable ASR prefix — read by the
+        # endpoint detector for tier-2 silence budgeting.
+        self.handsfree: bool = False
+        self.vad: Optional[SileroVad] = None
+        self.chunker: Optional[FrameChunker] = None
+        self.endpoint: Optional[EndpointDetector] = None
+        self._stable_partial: str = ""
 
     async def send_json(self, obj: dict) -> None:
         async with self._send_lock:
@@ -305,25 +318,31 @@ class WsSession:
             "current_name": (current or {}).get("name") if current else None,
         })
 
-    async def handle_start_recording(self, ev: dict) -> None:
-        # Implicit interrupt if a chat is still streaming.
+    async def _cleanup_capture_orphans(self) -> None:
+        """Drop any leftover chat / ASR / draft before opening a fresh
+        capture. Shared by push-to-talk start + hands-free entry."""
         if self.chat_task is not None and not self.chat_task.done():
             await self.cancel_chat("new_recording")
-        # Cancel any orphaned ASR session from a prior recording.
         if self.asr is not None:
             await self.asr.cancel()
             self.asr = None
-        # Abort any orphaned draft too (would only happen if
-        # start_recording fired without an intervening stop).
         if self.draft is not None:
             try:
                 await self.draft.abort()
             except Exception:  # noqa: BLE001
                 logger.exception("orphan draft abort failed")
             self.draft = None
-        self.sample_rate = int(ev.get("sample_rate", 16000))
+
+    async def _begin_capture(self, sample_rate: int) -> bool:
+        """Open one recording segment: crash-safe draft + ASR session, then
+        state='recording'. Shared by push-to-talk (handle_start_recording)
+        and hands-free VAD onset. Returns True on success; on failure emits
+        an error event and stays idle. Callers clear orphans first via
+        _cleanup_capture_orphans."""
+        self.sample_rate = sample_rate
         self.audio_bytes = 0
         self.t_started = time.monotonic()
+        self._stable_partial = ""
 
         # Crash-safe buffer — opens a .pcm file + inserts row. Started
         # before ASR so even the first ASR-init error leaves us with
@@ -336,11 +355,14 @@ class WsSession:
             await self.send_json({"type": "error", "where": "draft_init",
                                   "message": f"{type(exc).__name__}: {exc}"})
             self.draft = None
-            return
+            return False
 
         async def on_partial(text: str, stable_text: str) -> None:
             if self.draft is not None:
                 self.draft.update_partial(text)
+            # Stash the stable prefix so the hands-free endpoint detector
+            # can read its tail for tier-2 silence budgeting.
+            self._stable_partial = stable_text or text
             await self.send_json({
                 "type": "asr_partial",
                 "text": text,
@@ -364,20 +386,32 @@ class WsSession:
                 pass
             self.draft = None
             self.asr = None
-            return
+            return False
         self.state = "recording"
+        return True
+
+    async def handle_start_recording(self, ev: dict) -> None:
+        await self._cleanup_capture_orphans()
+        await self._begin_capture(int(ev.get("sample_rate", 16000)))
 
     async def handle_stop_recording(self, ev: dict) -> None:
         if self.state != "recording":
             await self.send_json({"type": "error", "where": "stop_recording",
                                   "message": f"not recording (state={self.state})"})
             return
-        self.state = "idle"
         peak_level = ev.get("peak_level")
         client_meta = json.dumps({
             k: v for k, v in ev.items()
             if k not in ("type", "peak_level")
         }) if any(k for k in ev if k not in ("type", "peak_level")) else None
+        await self._finalize_capture(peak_level=peak_level, client_meta=client_meta)
+
+    async def _finalize_capture(self, *, peak_level, client_meta) -> None:
+        """Close the current recording segment + run the full
+        transcript→polish→intent→chat pipeline. Shared by push-to-talk stop
+        (handle_stop_recording) and the hands-free VAD endpoint. Assumes
+        state=='recording' on entry."""
+        self.state = "idle"
 
         # No audio captured — short-circuit with an empty transcript.
         if self.audio_bytes == 0:
@@ -721,6 +755,154 @@ class WsSession:
         emit a fresh workspace_list event."""
         await self._bootstrap_workspaces()
 
+    # --- hands-free (VAD-driven listening) ---------------------------------
+
+    async def handle_start_handsfree(self, ev: dict) -> None:
+        """Enter hands-free listening: the client streams PCM continuously
+        and Silero VAD + endpointing decide turn boundaries server-side.
+        Push-to-talk's start/stop_recording aren't used while it's on.
+        Re-entry rebuilds the VAD stack."""
+        if not settings.vad.enabled:
+            await self.send_json({"type": "error", "where": "handsfree",
+                                  "message": "VAD disabled on server (VAD_ENABLED=0)"})
+            return
+        if not settings.vad.model_exists:
+            await self.send_json({"type": "error", "where": "handsfree",
+                                  "message": f"silero model missing at {settings.vad.model_path}"})
+            return
+        await self._cleanup_capture_orphans()
+        self.sample_rate = int(ev.get("sample_rate", 16000))
+        try:
+            self.vad = SileroVad(str(settings.vad.model_path), self.sample_rate)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("silero load failed")
+            await self.send_json({"type": "error", "where": "handsfree",
+                                  "message": f"{type(exc).__name__}: {exc}"})
+            self.vad = None
+            return
+        self.chunker = FrameChunker()
+        self.endpoint = EndpointDetector(EndpointConfig(
+            threshold=settings.vad.threshold,
+            onset_ms=settings.vad.onset_ms,
+            silence_ms=settings.vad.silence_ms,
+            silence_ms_short=settings.vad.silence_ms_short,
+            silence_ms_long=settings.vad.silence_ms_long,
+        ))
+        self._stable_partial = ""
+        self.handsfree = True
+        self.state = "idle"  # listening — not yet capturing
+        logger.info("ws handsfree ON session=%s", (self.session_id or "?")[:8])
+        await self.send_json({"type": "handsfree_started"})
+        await self.send_json({"type": "vad_state", "state": "listening"})
+
+    async def handle_stop_handsfree(self, ev: dict) -> None:
+        """Leave hands-free. If a capture is mid-flight, finalize it so the
+        user's last words still get transcribed + answered; else drop any
+        orphan ASR/draft. Tears down the VAD stack."""
+        self.handsfree = False
+        if self.state == "recording":
+            await self._finalize_capture(
+                peak_level=None, client_meta=json.dumps({"mode": "handsfree"}))
+        else:
+            if self.asr is not None:
+                await self.asr.cancel()
+                self.asr = None
+            if self.draft is not None:
+                try:
+                    await self.draft.abort()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.draft = None
+        self.vad = None
+        self.chunker = None
+        self.endpoint = None
+        self._stable_partial = ""
+        logger.info("ws handsfree OFF session=%s", (self.session_id or "?")[:8])
+        await self.send_json({"type": "handsfree_stopped"})
+
+    async def _on_pcm(self, pcm_chunk: bytes) -> None:
+        """Route an inbound binary PCM frame. Hands-free → VAD pipeline;
+        push-to-talk → feed ASR only while recording."""
+        if self.handsfree:
+            await self._handsfree_pcm(pcm_chunk)
+            return
+        if self.state != "recording" or self.asr is None:
+            return
+        await self._feed_asr(pcm_chunk)
+
+    async def _feed_asr(self, pcm_chunk: bytes) -> None:
+        """Persist to the crash-safe draft, then feed ASR. Persist FIRST so
+        a feed error still leaves recoverable bytes on disk."""
+        self.audio_bytes += len(pcm_chunk)
+        if self.draft is not None:
+            try:
+                self.draft.append_pcm(pcm_chunk)
+            except Exception:  # noqa: BLE001
+                logger.exception("draft append_pcm failed")
+        if self.asr is None:
+            return
+        try:
+            await self.asr.feed(pcm_chunk)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("asr.feed failed")
+            await self.send_json({"type": "error", "where": "asr_partial",
+                                  "message": f"{type(exc).__name__}: {exc}"})
+
+    async def _handsfree_pcm(self, pcm_chunk: bytes) -> None:
+        """Run VAD over the re-blocked 256-sample frames, drive the endpoint
+        detector, and open/close captures on its events. Static silence
+        frames are NOT fed to ASR — that keeps the single MLX GPU thread
+        free except while someone is actually speaking."""
+        if self.vad is None or self.chunker is None or self.endpoint is None:
+            return
+        onset = False
+        endpoint = False
+        for frame in self.chunker.push(pcm_chunk):
+            prob = self.vad.prob(frame)  # sync, sub-ms, CPU — off the GPU thread
+            ev = self.endpoint.update(prob, self._stable_partial)
+            if ev == "onset":
+                onset = True
+            elif ev == "endpoint":
+                endpoint = True
+        # Open the capture BEFORE feeding this chunk so the onset audio is
+        # included; close it AFTER feeding so trailing words are captured.
+        if onset:
+            await self._handsfree_onset()
+        if self.state == "recording" and self.asr is not None:
+            await self._feed_asr(pcm_chunk)
+        if endpoint:
+            await self._handsfree_endpoint()
+
+    async def _handsfree_onset(self) -> None:
+        """VAD detected speech onset. Barge-in: cancel any streaming reply
+        (the user is talking over it), then open a fresh capture."""
+        if self.chat_task is not None and not self.chat_task.done():
+            await self.cancel_chat("barge_in")
+        await self.send_json({"type": "vad_state", "state": "speech"})
+        ok = await self._begin_capture(self.sample_rate)
+        if not ok:
+            # capture failed to open — reset so the next onset can retry
+            if self.endpoint is not None:
+                self.endpoint.reset()
+            if self.vad is not None:
+                self.vad.reset()
+
+    async def _handsfree_endpoint(self) -> None:
+        """VAD detected end-of-turn. Finalize the capture (→ transcript →
+        polish → intent → chat), then resume listening with fresh VAD
+        state."""
+        await self.send_json({"type": "vad_state", "state": "endpoint"})
+        if self.state == "recording":
+            await self._finalize_capture(
+                peak_level=None, client_meta=json.dumps({"mode": "handsfree"}))
+        # endpoint detector already auto-reset to WAITING; clear the LSTM
+        # state + stale partial so the next turn starts clean.
+        if self.vad is not None:
+            self.vad.reset()
+        self._stable_partial = ""
+        if self.handsfree:
+            await self.send_json({"type": "vad_state", "state": "listening"})
+
     # --- main loop ---------------------------------------------------------
 
     HANDLERS = {
@@ -736,6 +918,8 @@ class WsSession:
         "set_workspace":      "handle_set_workspace",
         "set_preset":         "handle_set_preset",
         "refresh_workspaces": "handle_refresh_workspaces",
+        "start_handsfree":    "handle_start_handsfree",
+        "stop_handsfree":     "handle_stop_handsfree",
     }
 
     async def run(self) -> None:
@@ -747,25 +931,10 @@ class WsSession:
                 if msg.get("type") == "websocket.disconnect":
                     break
 
-                # Binary frames: PCM during recording window.
+                # Binary frames: PCM. Push-to-talk feeds ASR only during the
+                # recording window; hands-free routes every frame through VAD.
                 if "bytes" in msg and msg["bytes"] is not None:
-                    if self.state != "recording" or self.asr is None:
-                        continue
-                    pcm_chunk = msg["bytes"]
-                    self.audio_bytes += len(pcm_chunk)
-                    # Persist FIRST, then feed ASR — if ASR raises we
-                    # still have the bytes on disk for recovery.
-                    if self.draft is not None:
-                        try:
-                            self.draft.append_pcm(pcm_chunk)
-                        except Exception:  # noqa: BLE001
-                            logger.exception("draft append_pcm failed")
-                    try:
-                        await self.asr.feed(pcm_chunk)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.exception("asr.feed failed")
-                        await self.send_json({"type": "error", "where": "asr_partial",
-                                              "message": f"{type(exc).__name__}: {exc}"})
+                    await self._on_pcm(msg["bytes"])
                     continue
 
                 text_frame = msg.get("text")
@@ -794,6 +963,11 @@ class WsSession:
         except Exception:  # noqa: BLE001
             logger.exception("ws handler crashed")
         finally:
+            # Hands-free teardown — stop routing PCM through VAD.
+            self.handsfree = False
+            self.vad = None
+            self.chunker = None
+            self.endpoint = None
             # Clean up dangling ASR session before chat — if WS dies
             # mid-recording the upstream WS needs an explicit close.
             if self.asr is not None:

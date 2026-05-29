@@ -15,6 +15,9 @@ transcripts.db
 transcripts.db-journal
 recordings/
 
+# local Silero VAD weights (onnx ~2.3MB) — fetched at setup, not committed
+models/
+
 # macOS
 .DS_Store
 
