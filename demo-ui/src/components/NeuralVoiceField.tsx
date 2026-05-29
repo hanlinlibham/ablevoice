@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef } from "react";
 export type NeuralVoicePhase =
   | "offline"
   | "idle"
+  | "armed"
   | "listening"
   | "polishing"
   | "thinking"
@@ -191,6 +192,18 @@ const PALETTES: Record<NeuralVoicePhase, Palette> = {
     currentSpeed: 0.42,
     coreScale: 0.72,
   },
+  armed: {
+    primary: [110, 198, 206],
+    secondary: [107, 159, 227],
+    current: [230, 224, 212],
+    bgTop: [8, 10, 16],
+    bgBottom: [10, 13, 20],
+    linkAlpha: 0.3,
+    nodeAlpha: 0.74,
+    motion: 0.46,
+    currentSpeed: 0.78,
+    coreScale: 0.86,
+  },
   listening: {
     primary: [230, 196, 102],
     secondary: [201, 100, 66],
@@ -256,6 +269,7 @@ const PALETTES: Record<NeuralVoicePhase, Palette> = {
 const PHASE_BORDER: Record<NeuralVoicePhase, string> = {
   offline: "border-rose-500/20",
   idle: "border-cyan-500/20",
+  armed: "border-teal-500/35 shadow-[0_0_26px_rgba(45,212,191,0.12)]",
   listening: "border-amber-500/45 shadow-[0_0_34px_rgba(245,158,11,0.16)]",
   polishing: "border-fuchsia-500/40 shadow-[0_0_32px_rgba(217,70,239,0.14)]",
   thinking: "border-emerald-500/35 shadow-[0_0_32px_rgba(74,222,128,0.12)]",

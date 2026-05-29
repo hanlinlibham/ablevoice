@@ -15,6 +15,7 @@ import {
   NeuralVoiceField,
   type NeuralSemanticSignal,
   type NeuralVoiceApiState,
+  type NeuralVoicePhase,
 } from "./components/NeuralVoiceField";
 import { NeuralNebula } from "./components/NeuralNebula";
 
@@ -1080,6 +1081,22 @@ export default function App() {
     setRecordingStartedAt(ws.recording ? Date.now() : null);
   }, [ws.recording]);
 
+  // hands-free 收尾:VAD 判定话轮结束的瞬间打一个收束脉冲 — 星云上有个
+  // "收到"的能量注入,随后 chat 起来自然过渡到 thinking。
+  useEffect(() => {
+    if (ws.vadState === "endpoint") pulseSemantic("收束", "system", 0.7);
+  }, [ws.vadState, pulseSemantic]);
+
+  // hands-free 三态映射成星云 phase。待命=armed,说话=listening(坍缩),
+  // endpoint 收尾交给默认推导(此时 chat 已起 → thinking)。
+  const handsfreePhase: NeuralVoicePhase | undefined = ws.handsfree
+    ? (ws.vadState === "speech"
+        ? "listening"
+        : ws.vadState === "endpoint"
+          ? undefined
+          : "armed")
+    : undefined;
+
   const voiceVisualState = useMemo<NeuralVoiceApiState>(() => ({
     connected: ws.connected,
     recording: ws.recording || (ws.handsfree && ws.vadState === "speech"),
@@ -1094,6 +1111,10 @@ export default function App() {
     semanticSignal,
     visualIntensity: visualFeedbackLevel / 2,
     coalescing,
+    // hands-free 子状态 → 显式 phase:待命聆听=armed(半聚拢呼吸),说话中=
+    // listening(引力坍缩),endpoint 不强制 → undefined 让它自然过渡到
+    // thinking。非 hands-free 时 undefined,星云走内部默认推导。
+    phase: handsfreePhase,
   }), [
     ws.connected,
     ws.recording,

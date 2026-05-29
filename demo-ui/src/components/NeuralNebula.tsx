@@ -72,6 +72,13 @@ const PROFILES: Record<NeuralVoicePhase, Profile> = {
     jitter: 0.05, tremor: 0, damping: 0.9, baseEnergy: 0.06, coreGlow: 0.12,
     arcRate: 0.05, arcLife: 0.45, arcIntensity: 0.36, spin: 0.028, eject: 0,
   },
+  // hands-free 待命聆听:半聚拢、缓慢呼吸、通电感。介于 idle(满天星)
+  // 与 listening(坍缩)之间 —— "竖起耳朵但还没开始说话"。
+  armed: {
+    collapse: 0.32, coreRadius: 0.92, ballStiff: 5, homeStiff: 1.6, swirl: 0.05,
+    jitter: 0.04, tremor: 0.008, damping: 0.9, baseEnergy: 0.11, coreGlow: 0.2,
+    arcRate: 0.07, arcLife: 0.5, arcIntensity: 0.34, spin: 0.022, eject: 0,
+  },
   listening: {
     collapse: 0.9, coreRadius: 0.62, ballStiff: 9, homeStiff: 0.6, swirl: 0.12,
     jitter: 0.06, tremor: 0.03, damping: 0.85, baseEnergy: 0.26, coreGlow: 0.42,
@@ -136,6 +143,7 @@ function stateActivity(state: NeuralVoiceApiState, phase: NeuralVoicePhase): num
   const base =
     phase === "offline" ? 0.04 :
     phase === "idle" ? 0.28 :
+    phase === "armed" ? 0.42 :
     phase === "listening" ? Math.max(0.5, mic) :
     phase === "speaking" ? 0.85 :
     phase === "polishing" ? 0.7 :
@@ -399,7 +407,7 @@ export function NeuralNebula({ apiState, className = "", frameless = false }: Ne
     const composer = new EffectComposer(renderer);
     const renderPass = new RenderPass(scene, camera);
     composer.addPass(renderPass);
-    const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.5, 0.8, 0.62);
+    const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.5, 0.45, 0.72);
     composer.addPass(bloom);
     const outputPass = new OutputPass();
     composer.addPass(outputPass);
@@ -597,7 +605,9 @@ export function NeuralNebula({ apiState, className = "", frameless = false }: Ne
         const coreT = clamp(1 - dist / (coreWorld * 1.4));
         const glowMul = phase === "speaking" ? 0.6 + env * 0.7 : 1;
         const twinkle = (1 - cur.collapse) * Math.max(0, Math.sin(time * 1.2 + seedArr[i])) * 0.16;
-        const targetE = cur.baseEnergy + coreT * cur.coreGlow * glowMul + energyBoost[i] + twinkle;
+        // 外围基线随归一化半径平方衰减 → 球缘灰雾收敛,整体更黑更聚焦
+        const edgeFade = 0.32 + 0.68 * (1 - homeFrac[i] * homeFrac[i]);
+        const targetE = cur.baseEnergy * edgeFade + coreT * cur.coreGlow * glowMul + energyBoost[i] + twinkle;
         energyBase[i] = lerp(energyBase[i], targetE, clamp(dt * 4));
         flash[i] *= Math.pow(0.86, dt * 60);
         energyData[i] = clamp(energyBase[i] + flash[i], 0, 2.4);
@@ -723,7 +733,7 @@ export function NeuralNebula({ apiState, className = "", frameless = false }: Ne
       group.rotation.x = Math.sin(time * 0.05) * 0.12;
 
       // bloom 强度随 activity 微调(更密更亮 = 更强泛光,但克制避免白爆)
-      bloom.strength = lerp(0.28, 0.58, clamp(activity * 0.7 + cur.collapse * 0.25));
+      bloom.strength = lerp(0.22, 0.46, clamp(activity * 0.7 + cur.collapse * 0.25));
 
       composer.render();
     };
