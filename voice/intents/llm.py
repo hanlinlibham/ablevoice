@@ -39,7 +39,35 @@ def _to_dicts(messages: list[BaseMessage]) -> list[dict]:
 
 async def run_classify(messages: list[BaseMessage]) -> str:
     """Single-shot LLM call for classification. Returns the assistant
-    content (typically a JSON blob). Retries transient failures."""
+    content (typically a JSON blob). Dispatches on ``INTENT_PROVIDER``.
+
+    ``off`` never reaches here — ``classify.classify`` short-circuits it
+    to CHAT before any LLM call.
+    """
+    provider = settings.intent.provider
+    if provider == "mlx":
+        return await _run_classify_mlx(messages)
+    if provider == "dashscope":
+        return await _run_classify_dashscope(messages)
+    raise RuntimeError(
+        f"run_classify reached with unsupported INTENT_PROVIDER={provider!r}"
+    )
+
+
+async def _run_classify_mlx(messages: list[BaseMessage]) -> str:
+    """Route the classify prompt through the local MLX chat LLM so a
+    pure-local preset stays offline. One-shot: drain the token stream and
+    return the joined text for ``classify.py`` to parse."""
+    from ..providers.llm import MlxLlm  # noqa: PLC0415 — heavy mlx import
+
+    llm = MlxLlm()
+    chunks: list[str] = []
+    async for delta in llm.stream(_to_dicts(messages), session_id="intent-classify"):
+        chunks.append(delta)
+    return "".join(chunks).strip()
+
+
+async def _run_classify_dashscope(messages: list[BaseMessage]) -> str:
     if not settings.dashscope.api_key:
         raise RuntimeError(
             "INTENT_PROVIDER=dashscope but DASHSCOPE_API_KEY not set"

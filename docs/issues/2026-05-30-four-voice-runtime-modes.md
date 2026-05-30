@@ -1,8 +1,33 @@
 # Issue: formalize four voice runtime modes
 
-**Status**: proposed
+**Status**: in progress — config layer landed (slices 1, 3, 5); mode 3 agent
+runtime (slice 4) deferred
 **Date**: 2026-05-30
 **Owner**: ablevoice probe owner
+
+## Progress (2026-05-30)
+
+Config-layer slices implemented; the local-agent runtime is intentionally not
+built yet.
+
+- **Slice 1 — VOICE_MODE labels**: all four modes now validate in
+  `voice/config.py` (`asr_tts`, `chat`, `agent`, `online`). `agent` is a
+  reserved label that fails loud at startup with a NotImplemented message
+  pointing here, so it can't silently degrade to plain chat. `.env.example`
+  documents the four modes + the pure-local preset.
+- **Slice 2 — mode 1 asr_tts**: already implemented previously
+  (`ws.py:_emit_asr_tts_turn`).
+- **Slice 3 — pure-local integrity**: `INTENT_PROVIDER` now accepts
+  `dashscope | mlx | off` (was dashscope-only). `off` short-circuits to CHAT
+  with no LLM call; `mlx` routes the classify prompt through the local chat
+  LLM. Startup warns when an all-MLX stack still leaks polish/intent to
+  DashScope. Intent is folded into the `needs_dashscope` cred warning.
+- **Slice 5 — mode matrix tests**: added config tests (four modes, agent
+  NotImplemented, intent provider validation, pure-local offline preset) and
+  intent-dispatch tests (`off` short-circuit, mlx/dashscope routing). Unit
+  suite green.
+- **Slice 4 — local agent runtime**: deferred. `VOICE_MODE=agent` reserved
+  but unimplemented (see Mode 3 below). This is the remaining large piece.
 
 ## Background
 

@@ -27,7 +27,7 @@ def _reload(monkeypatch, **env):
         "TTS_RESPONSE_FORMAT", "TTS_BIT_RATE",
         "SYSTEM_PROMPT", "SYSTEM_PROMPT_FILE",
         "CHAT_SENT_SOFT_CAP", "MLX_TTS_TEMPERATURE",
-        "VOICE_MODE",
+        "VOICE_MODE", "INTENT_PROVIDER", "INTENT_ENABLED",
     ]:
         monkeypatch.delenv(k, raising=False)
     for k, v in env.items():
@@ -82,6 +82,71 @@ def test_voice_mode_asr_tts_loads(monkeypatch):
     cfg = _reload(monkeypatch, VOICE_MODE="asr_tts")
     assert cfg.settings.voice_mode == "asr_tts"
     assert cfg.public_view()["providers"]["voice_mode"] == "asr_tts"
+
+
+# --- VOICE_MODE matrix (four runtime modes) ---------------------------------
+
+def test_voice_mode_online_loads(monkeypatch):
+    """Mode 4: ``online`` is a valid label that maps to the cloud preset."""
+    cfg = _reload(
+        monkeypatch,
+        VOICE_MODE="online",
+        ASR_PROVIDER="dashscope", LLM_PROVIDER="ablework", TTS_PROVIDER="dashscope",
+    )
+    assert cfg.settings.voice_mode == "online"
+    assert cfg.public_view()["providers"]["voice_mode"] == "online"
+
+
+def test_voice_mode_chat_default(monkeypatch):
+    """Mode 2: default mode is the local-capable chat assistant."""
+    cfg = _reload(monkeypatch)
+    assert cfg.settings.voice_mode == "chat"
+
+
+def test_voice_mode_agent_not_implemented(monkeypatch):
+    """Mode 3: ``agent`` is a reserved label whose runtime isn't built — it
+    must fail loud with a NotImplemented-style message, not silently fall
+    through to plain chat."""
+    with pytest.raises(RuntimeError, match="VOICE_MODE=agent is not implemented"):
+        _reload(monkeypatch, VOICE_MODE="agent")
+
+
+# --- INTENT_PROVIDER (pure-local intent path) -------------------------------
+
+def test_intent_provider_default_is_dashscope(monkeypatch):
+    cfg = _reload(monkeypatch)
+    assert cfg.settings.intent.provider == "dashscope"
+
+
+def test_intent_provider_mlx_loads(monkeypatch):
+    cfg = _reload(monkeypatch, INTENT_PROVIDER="mlx")
+    assert cfg.settings.intent.provider == "mlx"
+
+
+def test_intent_provider_off_loads(monkeypatch):
+    cfg = _reload(monkeypatch, INTENT_PROVIDER="off")
+    assert cfg.settings.intent.provider == "off"
+
+
+def test_intent_provider_invalid_raises(monkeypatch):
+    with pytest.raises(RuntimeError, match="INTENT_PROVIDER"):
+        _reload(monkeypatch, INTENT_PROVIDER="bogus")
+
+
+def test_pure_local_preset_loads_offline(monkeypatch):
+    """A genuinely pure-local preset (all MLX, intent localized/off) must
+    load clean with no DashScope/ablework creds present."""
+    cfg = _reload(
+        monkeypatch,
+        VOICE_MODE="chat",
+        ASR_PROVIDER="mlx", LLM_PROVIDER="mlx", TTS_PROVIDER="mlx",
+        POLISH_PROVIDER="mlx", INTENT_PROVIDER="off",
+    )
+    assert cfg.settings.voice_mode == "chat"
+    assert cfg.settings.intent.provider == "off"
+    assert cfg.settings.asr.provider == "mlx"
+    assert cfg.settings.llm.provider == "mlx"
+    assert cfg.settings.tts.provider == "mlx"
 
 
 def test_tts_realtime_dispatch_by_model_name(monkeypatch):

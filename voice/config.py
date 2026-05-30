@@ -215,7 +215,10 @@ class IntentConfig:
     """Voice intent classifier — routes polished user text to either
     chat (default) or one of the ws_* operations.
 
-    ``provider``: only ``dashscope`` for now (qwen-flash via OAI-compat).
+    ``provider``: ``dashscope`` (qwen-flash via OAI-compat), ``mlx`` (route
+    the classify call through the local MLX chat LLM — keeps a pure-local
+    preset offline), or ``off`` (skip the LLM classify entirely; rely on the
+    regex pre-filter and treat everything as CHAT).
     ``ds_model``: which model. Bake-off picked ``qwen-flash`` (TTFT
     ~440ms,total ~510ms,14/14 quality on intent test set).
     ``min_confidence``: classifier outputs <below default to CHAT so
@@ -225,7 +228,7 @@ class IntentConfig:
     containing workspace keywords pay LLM latency — vast majority
     of normal chat turns skip the classify call entirely."""
     enabled: bool
-    provider: str          # "dashscope" (only supported for now)
+    provider: str          # "dashscope" | "mlx" | "off"
     ds_model: str          # e.g. "qwen-flash"
     min_confidence: float
     pre_filter: bool
@@ -497,7 +500,12 @@ def _validate(s: Settings) -> None:
     valid_llm = {"mlx", "ollama", "dashscope", "ablework"}
     valid_tts = {"mlx", "dashscope"}
     valid_polish = {"mlx", "dashscope", "off"}
-    valid_voice_modes = {"chat", "asr_tts"}
+    valid_intent = {"dashscope", "mlx", "off"}
+    # The four user-facing runtime modes (see
+    # docs/issues/2026-05-30-four-voice-runtime-modes.md). ``agent`` is a
+    # reserved label whose local runtime is not built yet — it validates as
+    # a known mode but is rejected below with a clear NotImplemented message.
+    valid_voice_modes = {"asr_tts", "chat", "agent", "online"}
     valid_rt_modes = {"server_commit", "commit"}
     valid_rt_formats = {"pcm", "wav", "mp3", "opus"}
     if s.asr.provider not in valid_asr:
@@ -508,8 +516,17 @@ def _validate(s: Settings) -> None:
         raise RuntimeError(f"TTS_PROVIDER={s.tts.provider!r} not in {valid_tts}")
     if s.polish.provider not in valid_polish:
         raise RuntimeError(f"POLISH_PROVIDER={s.polish.provider!r} not in {valid_polish}")
+    if s.intent.provider not in valid_intent:
+        raise RuntimeError(f"INTENT_PROVIDER={s.intent.provider!r} not in {valid_intent}")
     if s.voice_mode not in valid_voice_modes:
         raise RuntimeError(f"VOICE_MODE={s.voice_mode!r} not in {valid_voice_modes}")
+    if s.voice_mode == "agent":
+        raise RuntimeError(
+            "VOICE_MODE=agent is not implemented yet. The local agent runtime "
+            "(LocalAgentRuntime + tool policy + permission gates) is a separate "
+            "slice — see docs/issues/2026-05-30-four-voice-runtime-modes.md "
+            "(Mode 3). Use VOICE_MODE=asr_tts / chat / online for now."
+        )
     if s.dashscope.tts_realtime_mode not in valid_rt_modes:
         raise RuntimeError(
             f"DASHSCOPE_TTS_REALTIME_MODE={s.dashscope.tts_realtime_mode!r} "
@@ -539,13 +556,37 @@ def _validate(s: Settings) -> None:
         (s.asr.provider == "dashscope") or
         (s.llm.provider == "dashscope") or
         (s.tts.provider == "dashscope") or
-        (s.polish.enabled and s.polish.provider == "dashscope")
+        (s.polish.enabled and s.polish.provider == "dashscope") or
+        (s.intent.enabled and s.intent.provider == "dashscope")
     )
     if needs_dashscope and not s.dashscope.has_key:
         logger.warning(
             "DASHSCOPE_API_KEY empty — calls to dashscope-backed providers will fail. "
             "Set it in .env.local (see .env.example)."
         )
+
+    # Pure-local integrity: when the core ASR/LLM/TTS stack is all MLX, a
+    # "pure local" claim is invalid if polish or intent silently fall back to
+    # DashScope. Warn loudly so the operator either localizes them (mlx) or
+    # turns them off, instead of unknowingly shipping audio/text to the cloud.
+    pure_local_stack = (
+        s.asr.provider == "mlx"
+        and s.llm.provider == "mlx"
+        and s.tts.provider == "mlx"
+    )
+    if pure_local_stack and s.voice_mode in {"chat", "asr_tts"}:
+        leaks = []
+        if s.polish.enabled and s.polish.provider == "dashscope":
+            leaks.append("POLISH_PROVIDER=dashscope")
+        if s.intent.enabled and s.intent.provider == "dashscope":
+            leaks.append("INTENT_PROVIDER=dashscope")
+        if leaks:
+            logger.warning(
+                "VOICE_MODE=%s with an all-MLX ASR/LLM/TTS stack still routes "
+                "%s to the cloud — this is NOT pure-local. Set those to mlx or "
+                "off for a genuinely offline preset.",
+                s.voice_mode, " + ".join(leaks),
+            )
     if s.llm.provider == "ablework" and not s.ablework.has_token:
         logger.warning(
             "ABLEWORK_TOKEN empty — ablework calls will fail. "

@@ -106,6 +106,47 @@ class TestParseClassifyOutput:
         assert r.workspace_match is None
 
 
+# --- Provider dispatch / pure-local path -----------------------------------
+
+class TestIntentProviderDispatch:
+
+    @pytest.mark.asyncio
+    async def test_off_short_circuits_to_chat(self, monkeypatch):
+        """INTENT_PROVIDER=off must return CHAT without touching the LLM —
+        even for text the regex pre-filter would have flagged."""
+        import voice.intents.classify as cls
+        fake = MagicMock()
+        fake.intent.provider = "off"
+        monkeypatch.setattr(cls, "settings", fake)
+        spy = AsyncMock()
+        monkeypatch.setattr(cls, "run_classify", spy)
+
+        r = await cls.classify("切到 coding 工作区", [])
+        assert r.intent == Intent.CHAT
+        assert r.skipped_classify is True
+        spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_classify_routes_to_mlx(self, monkeypatch):
+        import voice.intents.llm as llm_mod
+        fake = MagicMock()
+        fake.intent.provider = "mlx"
+        monkeypatch.setattr(llm_mod, "settings", fake)
+        monkeypatch.setattr(llm_mod, "_run_classify_mlx",
+                            AsyncMock(return_value="MLX_OUT"))
+        assert await llm_mod.run_classify([]) == "MLX_OUT"
+
+    @pytest.mark.asyncio
+    async def test_run_classify_routes_to_dashscope(self, monkeypatch):
+        import voice.intents.llm as llm_mod
+        fake = MagicMock()
+        fake.intent.provider = "dashscope"
+        monkeypatch.setattr(llm_mod, "settings", fake)
+        monkeypatch.setattr(llm_mod, "_run_classify_dashscope",
+                            AsyncMock(return_value="DS_OUT"))
+        assert await llm_mod.run_classify([]) == "DS_OUT"
+
+
 # --- WorkspaceCache fuzzy match -------------------------------------------
 
 WS_FIXTURE = [

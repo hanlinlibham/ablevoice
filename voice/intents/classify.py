@@ -86,6 +86,15 @@ async def classify(text: str, workspaces: list[dict]) -> IntentResult:
     Returns IntentResult with timing populated. Caller can check
     ``.skipped_classify`` to see whether the LLM was called.
     """
+    # INTENT_PROVIDER=off — never call an LLM. Everything is CHAT; the only
+    # workspace routing left is whatever the meta-command layer catches
+    # upstream. Keeps a pure-local preset from reaching for the cloud.
+    if settings.intent.provider == "off":
+        return IntentResult(
+            intent=Intent.CHAT, raw_text=text,
+            confidence=1.0, skipped_classify=True,
+        )
+
     if settings.intent.pre_filter and not looks_like_workspace_op(text):
         return IntentResult(
             intent=Intent.CHAT, raw_text=text,
