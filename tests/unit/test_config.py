@@ -27,6 +27,7 @@ def _reload(monkeypatch, **env):
         "TTS_RESPONSE_FORMAT", "TTS_BIT_RATE",
         "SYSTEM_PROMPT", "SYSTEM_PROMPT_FILE",
         "CHAT_SENT_SOFT_CAP", "MLX_TTS_TEMPERATURE",
+        "VOICE_MODE",
     ]:
         monkeypatch.delenv(k, raising=False)
     for k, v in env.items():
@@ -40,6 +41,7 @@ def test_defaults_load_clean(monkeypatch):
     assert cfg.settings.asr.provider == "dashscope"
     assert cfg.settings.llm.provider == "ablework"
     assert cfg.settings.tts.provider == "dashscope"
+    assert cfg.settings.voice_mode == "chat"
     assert cfg.settings.tts.voice == "Maia"
     assert cfg.settings.warmup is True
     assert cfg.settings.storage.keep_audio is False
@@ -48,6 +50,9 @@ def test_defaults_load_clean(monkeypatch):
 def test_invalid_provider_raises(monkeypatch):
     with pytest.raises(RuntimeError, match="ASR_PROVIDER"):
         _reload(monkeypatch, ASR_PROVIDER="bogus")
+
+    with pytest.raises(RuntimeError, match="VOICE_MODE"):
+        _reload(monkeypatch, VOICE_MODE="bogus")
 
 
 def test_bool_parsing(monkeypatch):
@@ -66,6 +71,17 @@ def test_active_model_id_dispatches(monkeypatch):
     assert cfg.settings.asr_active_model_id == cfg.settings.dashscope.asr_model
     cfg = _reload(monkeypatch, ASR_PROVIDER="mlx")
     assert cfg.settings.asr_active_model_id == cfg.settings.asr.mlx_model
+
+
+def test_mlx_tts_default_voice_is_supported(monkeypatch):
+    cfg = _reload(monkeypatch, TTS_PROVIDER="mlx")
+    assert cfg.settings.tts.voice == "serena"
+
+
+def test_voice_mode_asr_tts_loads(monkeypatch):
+    cfg = _reload(monkeypatch, VOICE_MODE="asr_tts")
+    assert cfg.settings.voice_mode == "asr_tts"
+    assert cfg.public_view()["providers"]["voice_mode"] == "asr_tts"
 
 
 def test_tts_realtime_dispatch_by_model_name(monkeypatch):

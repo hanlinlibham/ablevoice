@@ -90,6 +90,7 @@ class DraftRow(BaseModel):
 async def health() -> dict[str, object]:
     return {
         "ok": True,
+        "voice_mode": settings.voice_mode,
         "model_loaded": mlx_session_loaded(),
         "asr_provider": settings.asr.provider,
         "asr_model_id": settings.asr_active_model_id,

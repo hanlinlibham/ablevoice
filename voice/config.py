@@ -286,6 +286,7 @@ class Settings:
     sentence: SentenceConfig
     storage: StorageConfig
     vad: VadConfig
+    voice_mode: str
     warmup: bool
 
     # Convenience accessors — keep call sites readable.
@@ -353,6 +354,9 @@ def _load_system_prompt(data_dir: Path) -> str:
 
 def _load() -> Settings:
     data_dir = Path(__file__).resolve().parent.parent
+    asr_provider = _env_str("ASR_PROVIDER", "dashscope").lower()
+    tts_provider = _env_str("TTS_PROVIDER", "dashscope").lower()
+    default_tts_voice = "serena" if tts_provider == "mlx" else "Maia"
     return Settings(
         dashscope=DashscopeConfig(
             api_key=_env_str("DASHSCOPE_API_KEY", ""),
@@ -401,7 +405,7 @@ def _load() -> Settings:
             think=_env_bool("OLLAMA_THINK", False),
         ),
         asr=AsrConfig(
-            provider=_env_str("ASR_PROVIDER", "dashscope").lower(),
+            provider=asr_provider,
             mlx_model=_env_str("MLX_QWEN_MODEL", "Qwen/Qwen3-ASR-1.7B"),
             stream_chunk_sec=_env_float("ASR_STREAM_CHUNK_SEC", 1.5),
         ),
@@ -412,12 +416,12 @@ def _load() -> Settings:
             system_prompt=_load_system_prompt(data_dir),
         ),
         tts=TtsConfig(
-            provider=_env_str("TTS_PROVIDER", "dashscope").lower(),
+            provider=tts_provider,
             mlx_model=_env_str(
                 "MLX_TTS_MODEL", "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16"
             ),
             sr=_env_int("MLX_TTS_SR", 24000),
-            voice=_env_str("MLX_TTS_VOICE", "Maia"),
+            voice=_env_str("MLX_TTS_VOICE", default_tts_voice),
             lang=_env_str("MLX_TTS_LANG", "chinese"),
             temperature=_env_float("MLX_TTS_TEMPERATURE", 0.5),
             seed=_env_int("MLX_TTS_SEED", 42),
@@ -477,6 +481,7 @@ def _load() -> Settings:
             silence_ms_short=_env_int("VAD_SILENCE_MS_SHORT", 480),
             silence_ms_long=_env_int("VAD_SILENCE_MS_LONG", 1500),
         ),
+        voice_mode=_env_str("VOICE_MODE", "chat").lower(),
         warmup=_env_bool("WARMUP", True),
     )
 
@@ -492,6 +497,7 @@ def _validate(s: Settings) -> None:
     valid_llm = {"mlx", "ollama", "dashscope", "ablework"}
     valid_tts = {"mlx", "dashscope"}
     valid_polish = {"mlx", "dashscope", "off"}
+    valid_voice_modes = {"chat", "asr_tts"}
     valid_rt_modes = {"server_commit", "commit"}
     valid_rt_formats = {"pcm", "wav", "mp3", "opus"}
     if s.asr.provider not in valid_asr:
@@ -502,6 +508,8 @@ def _validate(s: Settings) -> None:
         raise RuntimeError(f"TTS_PROVIDER={s.tts.provider!r} not in {valid_tts}")
     if s.polish.provider not in valid_polish:
         raise RuntimeError(f"POLISH_PROVIDER={s.polish.provider!r} not in {valid_polish}")
+    if s.voice_mode not in valid_voice_modes:
+        raise RuntimeError(f"VOICE_MODE={s.voice_mode!r} not in {valid_voice_modes}")
     if s.dashscope.tts_realtime_mode not in valid_rt_modes:
         raise RuntimeError(
             f"DASHSCOPE_TTS_REALTIME_MODE={s.dashscope.tts_realtime_mode!r} "
@@ -565,7 +573,8 @@ def _log_summary(s: Settings) -> None:
         "no-model" if s.vad.enabled else "off"
     )
     logger.info(
-        "config: ASR=%s(%s) LLM=%s(%s) TTS=%s(%s, voice=%s) polish=%s vad=%s keep_audio=%s warmup=%s",
+        "config: mode=%s ASR=%s(%s) LLM=%s(%s) TTS=%s(%s, voice=%s) polish=%s vad=%s keep_audio=%s warmup=%s",
+        s.voice_mode,
         s.asr.provider, s.asr_active_model_id,
         s.llm.provider, s.llm_active_model_id,
         s.tts.provider, tts_tag, s.tts.voice,
@@ -592,6 +601,7 @@ def public_view() -> dict:
     s = settings
     return {
         "providers": {
+            "voice_mode": s.voice_mode,
             "asr": s.asr.provider,
             "llm": s.llm.provider,
             "tts": s.tts.provider,

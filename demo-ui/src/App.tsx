@@ -10,9 +10,9 @@ import {
   RefreshCw,
   StopCircle,
   AudioLines,
+  PanelRight,
 } from "lucide-react";
 import {
-  NeuralVoiceField,
   type NeuralSemanticSignal,
   type NeuralVoiceApiState,
   type NeuralVoicePhase,
@@ -159,38 +159,6 @@ function RecordingMeter({ level, peak, startedAt }: {
   );
 }
 
-/** Bottom hotkey hints — matches TUI Footer. Mouse-clickable too. */
-function HotkeyHints({ onSpace, onInterrupt, onReset, onToggleWsList, onTogglePolish, onQuit }: {
-  onSpace: () => void; onInterrupt: () => void; onReset: () => void;
-  onToggleWsList: () => void; onTogglePolish: () => void; onQuit?: () => void;
-}) {
-  const items: Array<[string, string, () => void]> = [
-    ["Space", "录音", onSpace],
-    ["i",     "打断", onInterrupt],
-    ["r",     "重置", onReset],
-    ["w",     "工作区", onToggleWsList],
-    ["p",     "polish", onTogglePolish],
-    ["⌘⇧Space", "全局录音", () => {}],   // not clickable; just info
-  ];
-  if (onQuit) items.push(["q", "退出", onQuit]);
-  return (
-    <div className="border-t border-(--color-border) bg-(--color-panel) px-4 py-1 flex items-center gap-3 text-[11px] font-mono text-(--color-muted) overflow-x-auto">
-      {items.map(([k, label, fn]) => (
-        <button
-          key={k}
-          type="button"
-          onClick={fn}
-          className="flex items-center gap-1 hover:text-(--color-accent) transition"
-          title={`${k} → ${label}`}
-        >
-          <kbd className="px-1 rounded border border-(--color-border)/50 bg-(--color-bg) text-(--color-text)/80">{k}</kbd>
-          <span>{label}</span>
-        </button>
-      ))}
-    </div>
-  );
-}
-
 type Entry = {
   id: string;
   kind: "user" | "assistant" | "system";
@@ -229,70 +197,156 @@ type HistoryRow = {
 
 /* --------------------------------------------------------------------------
  * Audio playback queue — append base64 WAV chunks as they stream in from
- * the server, play them sequentially. Used both by chat (multiple
- * sentence chunks) and the composer-textarea one-shot TTS (single
- * chunk).
- *
- * We use an HTMLAudioElement per chunk + a tiny scheduler instead of
- * Web Audio API because chunks are full WAV blobs (header + PCM) — the
- * cheapest "play this blob" tool the browser has. The downside is a few
- * ms of gap between chunks; for conversational TTS that's invisible.
+ * the server, then schedule them on one Web Audio timeline. DashScope
+ * realtime TTS often emits many 60-300ms mini-WAVs; playing those with
+ * one HTMLAudioElement per chunk creates audible seams. Here we parse the
+ * PCM payload directly and place every chunk at an exact AudioContext
+ * timestamp, so playback stays continuous even when chunks arrive fast.
  * ------------------------------------------------------------------------ */
 
 function useAudioQueue() {
-  const queueRef = useRef<{ url: string }[]>([]);
-  const currentRef = useRef<HTMLAudioElement | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const nextStartTimeRef = useRef(0);
+  const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const chainRef = useRef<Promise<void>>(Promise.resolve());
+  const generationRef = useRef(0);
   const [playing, setPlaying] = useState(false);
 
-  const playNext = useCallback(function playNextInner() {
-    const item = queueRef.current.shift();
-    if (!item) {
-      setPlaying(false);
-      currentRef.current = null;
-      return;
+  const ensureAudioContext = useCallback(async () => {
+    const existing = audioCtxRef.current;
+    if (existing && existing.state !== "closed") {
+      if (existing.state === "suspended") await existing.resume();
+      return existing;
     }
-    const audio = new Audio(item.url);
-    currentRef.current = audio;
-    audio.onended = () => {
-      URL.revokeObjectURL(item.url);
-      currentRef.current = null;
-      playNextInner();
-    };
-    audio.onerror = () => {
-      URL.revokeObjectURL(item.url);
-      currentRef.current = null;
-      playNextInner();
-    };
-    setPlaying(true);
-    void audio.play().catch(() => {
-      URL.revokeObjectURL(item.url);
-      currentRef.current = null;
-      playNextInner();
+
+    const AudioContextCtor = window.AudioContext ?? (window as Window & {
+      webkitAudioContext?: typeof AudioContext;
+    }).webkitAudioContext;
+    if (!AudioContextCtor) throw new Error("AudioContext unavailable");
+
+    const ctx = new AudioContextCtor();
+    audioCtxRef.current = ctx;
+    if (ctx.state === "suspended") await ctx.resume();
+    return ctx;
+  }, []);
+
+  const unlock = useCallback(() => {
+    void ensureAudioContext().catch((err: unknown) => {
+      console.warn("[audio-playback] unlock failed:", errorMessage(err));
     });
+  }, [ensureAudioContext]);
+
+  const decodePcmWav = useCallback((ctx: AudioContext, bytes: Uint8Array): AudioBuffer => {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const readTag = (offset: number) => String.fromCharCode(
+      view.getUint8(offset),
+      view.getUint8(offset + 1),
+      view.getUint8(offset + 2),
+      view.getUint8(offset + 3),
+    );
+    if (bytes.byteLength < 44 || readTag(0) !== "RIFF" || readTag(8) !== "WAVE") {
+      throw new Error("unsupported WAV container");
+    }
+
+    let audioFormat = 0;
+    let channels = 0;
+    let sampleRate = 0;
+    let bitsPerSample = 0;
+    let dataOffset = 0;
+    let dataSize = 0;
+
+    let offset = 12;
+    while (offset + 8 <= bytes.byteLength) {
+      const tag = readTag(offset);
+      const size = view.getUint32(offset + 4, true);
+      const start = offset + 8;
+      if (tag === "fmt ") {
+        audioFormat = view.getUint16(start, true);
+        channels = view.getUint16(start + 2, true);
+        sampleRate = view.getUint32(start + 4, true);
+        bitsPerSample = view.getUint16(start + 14, true);
+      } else if (tag === "data") {
+        dataOffset = start;
+        dataSize = size;
+      }
+      offset = start + size + (size % 2);
+    }
+
+    if (audioFormat !== 1 || bitsPerSample !== 16 || channels < 1 || sampleRate <= 0 || dataSize <= 0) {
+      throw new Error(`unsupported WAV format fmt=${audioFormat} bits=${bitsPerSample} channels=${channels}`);
+    }
+
+    const frameCount = Math.floor(dataSize / (channels * 2));
+    const buffer = ctx.createBuffer(channels, frameCount, sampleRate);
+    for (let ch = 0; ch < channels; ch++) {
+      const out = buffer.getChannelData(ch);
+      for (let i = 0; i < frameCount; i++) {
+        const sampleOffset = dataOffset + ((i * channels + ch) * 2);
+        out[i] = view.getInt16(sampleOffset, true) / 32768;
+      }
+    }
+    return buffer;
   }, []);
 
   const enqueueB64Wav = useCallback((b64: string) => {
     const binary = atob(b64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const blob = new Blob([bytes], { type: "audio/wav" });
-    const url = URL.createObjectURL(blob);
-    queueRef.current.push({ url });
-    if (!currentRef.current) playNext();
-  }, [playNext]);
+
+    const generation = generationRef.current;
+    chainRef.current = chainRef.current
+      .then(async () => {
+        if (generation !== generationRef.current) return;
+        const ctx = await ensureAudioContext();
+        if (generation !== generationRef.current) return;
+
+        const buffer = decodePcmWav(ctx, bytes);
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(ctx.destination);
+
+        const now = ctx.currentTime;
+        const startAt = Math.max(
+          nextStartTimeRef.current,
+          now + (nextStartTimeRef.current > now ? 0.015 : 0.08),
+        );
+        nextStartTimeRef.current = startAt + buffer.duration;
+        sourcesRef.current.add(source);
+        source.onended = () => {
+          source.disconnect();
+          sourcesRef.current.delete(source);
+          if (sourcesRef.current.size === 0 && ctx.currentTime >= nextStartTimeRef.current - 0.03) {
+            nextStartTimeRef.current = 0;
+            setPlaying(false);
+          }
+        };
+        source.start(startAt);
+        setPlaying(true);
+      })
+      .catch((err: unknown) => {
+        console.warn("[audio-playback] enqueue failed:", errorMessage(err));
+      });
+  }, [decodePcmWav, ensureAudioContext]);
 
   const stop = useCallback(() => {
-    queueRef.current.forEach((it) => URL.revokeObjectURL(it.url));
-    queueRef.current = [];
-    if (currentRef.current) {
-      currentRef.current.pause();
-      currentRef.current.src = "";
-      currentRef.current = null;
+    generationRef.current += 1;
+    chainRef.current = Promise.resolve();
+    for (const source of sourcesRef.current) {
+      try { source.stop(); } catch { /* already stopped */ }
+      try { source.disconnect(); } catch { /* already disconnected */ }
     }
+    sourcesRef.current.clear();
+    nextStartTimeRef.current = 0;
     setPlaying(false);
   }, []);
 
-  return { enqueueB64Wav, stop, playing };
+  useEffect(() => () => {
+    stop();
+    const ctx = audioCtxRef.current;
+    if (ctx && ctx.state !== "closed") void ctx.close();
+  }, [stop]);
+
+  return { enqueueB64Wav, stop, unlock, playing };
 }
 
 /* --------------------------------------------------------------------------
@@ -330,6 +384,7 @@ type VadState = "listening" | "speech" | "endpoint" | null;
 type ConfigSnapshot = {
   asr_provider: string; asr_model_id: string;
   tts_provider: string; tts_model_id: string; tts_voice: string;
+  voice_mode?: string;
   llm_provider: string; llm_model_id: string; tts_sr: number;
   preset: string | null; presets: Preset[];
 };
@@ -424,6 +479,29 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
   const analyserRafRef = useRef<number | null>(null);
   const peakRef = useRef(0);
 
+  // Tear down the mic → PCM graph. Shared by push-to-talk stop,
+  // hands-free stop, and websocket close; clears the browser mic indicator.
+  const teardownAudio = useCallback(() => {
+    if (analyserRafRef.current !== null) {
+      cancelAnimationFrame(analyserRafRef.current);
+      analyserRafRef.current = null;
+    }
+    if (workletNodeRef.current) {
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current.port.onmessage = null;
+      workletNodeRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+    setLevel(0);
+  }, []);
+
   // ── WebSocket lifecycle ──────────────────────────────────────────────
   useEffect(() => {
     // Build the WS URL from the page origin so the vite dev proxy
@@ -441,6 +519,10 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
     ws.onclose = () => {
       setConnected(false);
       wsRef.current = null;
+      setRecording(false);
+      setHandsfree(false);
+      setVadState(null);
+      teardownAudio();
     };
     ws.onerror = (e) => {
       // .onclose will fire after this.
@@ -475,10 +557,19 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
         case "interrupted":   h.onInterrupted?.(typeof msg.reason === "string" ? msg.reason : "?"); break;
         case "tts_done":      h.onTtsDone?.(msg as HandlerArg<"onTtsDone">); break;
         case "history_reset": h.onHistoryReset?.(typeof msg.cleared === "number" ? msg.cleared : 0); break;
-        case "error":         h.onError?.(
-          typeof msg.where === "string" ? msg.where : "?",
-          typeof msg.message === "string" ? msg.message : "?",
-        ); break;
+        case "error": {
+          const where = typeof msg.where === "string" ? msg.where : "?";
+          if (where === "handsfree") {
+            setHandsfree(false);
+            setVadState(null);
+            teardownAudio();
+          }
+          h.onError?.(
+            where,
+            typeof msg.message === "string" ? msg.message : "?",
+          );
+          break;
+        }
         case "transcript_polished": h.onTranscriptPolished?.(msg as HandlerArg<"onTranscriptPolished">); break;
         case "polish":        h.onPolish?.(msg as HandlerArg<"onPolish">); break;
         case "retry":         h.onRetry?.(msg as HandlerArg<"onRetry">); break;
@@ -497,34 +588,28 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
       }
     };
     return () => {
-      try { ws.close(); } catch { /* already closed */ }
+      // Detach handlers BEFORE closing. Under React StrictMode (and on any
+      // reconnect) this cleanup closes a still-CONNECTING socket; its async
+      // onclose/onerror would otherwise fire *after* the replacement socket
+      // has already opened, stomping connected→false and wsRef→null — which
+      // disables the record button with no error shown. Silencing the dead
+      // socket also clears the bogus "ws error / closed before established".
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
+      if (ws.readyState === WebSocket.CONNECTING) {
+        // Closing a CONNECTING socket makes the browser log a noisy
+        // "closed before the connection is established"; defer to its open
+        // event (handlers already detached, so it won't send or touch state).
+        ws.addEventListener("open", () => { try { ws.close(); } catch { /* noop */ } }, { once: true });
+      } else {
+        try { ws.close(); } catch { /* already closed */ }
+      }
     };
-  }, [sessionId]);
+  }, [sessionId, teardownAudio]);
 
   // ── recording lifecycle ──────────────────────────────────────────────
-  // Tear down the mic → PCM graph. Shared by push-to-talk stop and
-  // hands-free stop; clears the browser mic indicator immediately.
-  const teardownAudio = useCallback(() => {
-    if (analyserRafRef.current !== null) {
-      cancelAnimationFrame(analyserRafRef.current);
-      analyserRafRef.current = null;
-    }
-    if (workletNodeRef.current) {
-      workletNodeRef.current.disconnect();
-      workletNodeRef.current.port.onmessage = null;
-      workletNodeRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close().catch(() => {});
-      audioCtxRef.current = null;
-    }
-    setLevel(0);
-  }, []);
-
   // Build the mic → 16kHz int16 PCM → ws pipeline. Shared by push-to-talk
   // and hands-free. echoCancellation is ESSENTIAL for hands-free: the mic
   // stays open while TTS plays, so without AEC the assistant's own voice
@@ -564,6 +649,12 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
     }
     const audioCtx = new AudioContextCtor();
     audioCtxRef.current = audioCtx;
+    // Chrome's autoplay policy can hand back a *suspended* context even from
+    // a user gesture; if it stays suspended the worklet never runs, so no PCM
+    // is sent and the mic looks dead ("没接通"). Resume before wiring the graph.
+    if (audioCtx.state === "suspended") {
+      try { await audioCtx.resume(); } catch { /* best-effort */ }
+    }
     try {
       await audioCtx.audioWorklet.addModule("/pcm-worklet.js");
     } catch (err: unknown) {
@@ -576,9 +667,12 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
     const worklet = new AudioWorkletNode(audioCtx, "pcm-worklet");
     workletNodeRef.current = worklet;
     // The worklet posts int16 PCM ArrayBuffers; forward each one as a
-    // WebSocket binary frame. Cheap: no copy thanks to transfer.
+    // WebSocket binary frame. Always read the latest socket: after a
+    // reconnect, a long-lived hands-free mic graph must not keep writing
+    // into the socket that existed when the mic was first opened.
     worklet.port.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(ev.data);
+      const liveWs = wsRef.current;
+      if (liveWs && liveWs.readyState === WebSocket.OPEN) liveWs.send(ev.data);
     };
 
     // Parallel analyser for the UI level bar. Doesn't affect the worklet.
@@ -646,7 +740,6 @@ function useVoiceWS(sessionId: string, handlers: WSHandlers): VoiceWS {
     if (ws && ws.readyState === WebSocket.OPEN) {
       // Keep the mic open and let the server's VAD decide turn boundaries.
       ws.send(JSON.stringify({ type: "start_handsfree", sample_rate: 16000 }));
-      setHandsfree(true);
     }
   }, [setupAudio]);
 
@@ -715,6 +808,7 @@ export default function App() {
   const [polishing, setPolishing] = useState(false);   // true between transcript and transcript_polished
   const [latestTranscribeMs, setLatestTranscribeMs] = useState<number | null>(null);
   const [serverInfo, setServerInfo] = useState<{
+    voice_mode?: string;
     asr_model_id: string;
     tts_model_id: string;
     llm_model_id: string;
@@ -726,7 +820,9 @@ export default function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [currentWs, setCurrentWs] = useState<{ id: string | null; name: string }>({ id: null, name: "" });
   const [wsListOpen, setWsListOpen] = useState(false);
+  const [debugLogOpen, setDebugLogOpen] = useState(true);
   const [lastAction, setLastAction] = useState<{ text: string; until: number } | null>(null);
+  const [simpleNotice, setSimpleNotice] = useState<{ text: string; tone: "info" | "ok" | "warn" | "error" } | null>(null);
   // ── reconnect / retry banner (auto-fade after 4s) ──
   const [retryBanner, setRetryBanner] = useState<{ text: string; until: number } | null>(null);
   // ── recording started timestamp (for mm:ss timer in RecordingMeter)
@@ -767,6 +863,7 @@ export default function App() {
   const firstAudioAtRef = useRef<number | null>(null);
   const semanticNonceRef = useRef(0);
   const lastPartialPulseAtRef = useRef(0);
+  const pendingRecordStopRef = useRef(false);
 
   const append = useCallback((e: Omit<Entry, "id"> & { id?: string }) => {
     setEntries((prev) => [
@@ -843,6 +940,7 @@ export default function App() {
 
   const applyConfigSnapshot = useCallback((info: ConfigSnapshot) => {
     setServerInfo({
+      voice_mode: info.voice_mode,
       asr_model_id: info.asr_model_id,
       tts_model_id: info.tts_model_id,
       llm_model_id: info.llm_model_id,
@@ -878,6 +976,12 @@ export default function App() {
     },
     onTranscript: (t) => {
       setLatestTranscribeMs(t.ms);
+      setSimpleNotice({
+        tone: t.text.trim() ? "ok" : "warn",
+        text: t.text.trim()
+          ? `转写完成: ${t.text.slice(0, 28)}`
+          : `转写为空 · peak ${(((t.peak_level ?? 0)) * 100).toFixed(0)}%`,
+      });
       // Server emits transcript_polished within ~15ms-1.5s of transcript;
       // turn on polishing indicator that the polished event clears.
       setPolishing(true);
@@ -940,6 +1044,7 @@ export default function App() {
     onAudioChunk: (b64) => {
       if (firstAudioAtRef.current === null) {
         firstAudioAtRef.current = Math.round(performance.now() - turnT0Ref.current);
+        setSimpleNotice({ tone: "ok", text: `首音 ${firstAudioAtRef.current}ms` });
       }
       audioQueue.enqueueB64Wav(b64);
       const id = activeAssistantIdRef.current;
@@ -953,6 +1058,7 @@ export default function App() {
     },
     onChatDone: (s) => {
       pulseSemantic(s.full_text, "assistant", 0.88);
+      setSimpleNotice({ tone: "ok", text: `完成 · ${s.n_audio} 段语音 · ${s.total_ms}ms` });
       const id = activeAssistantIdRef.current;
       if (id) {
         setEntries((prev) => prev.map((e) =>
@@ -971,6 +1077,7 @@ export default function App() {
       setChatting(false);
     },
     onInterrupted: (reason) => {
+      setSimpleNotice({ tone: "warn", text: `已打断: ${reason}` });
       const id = activeAssistantIdRef.current;
       if (id) {
         setEntries((prev) => prev.map((e) =>
@@ -993,11 +1100,15 @@ export default function App() {
       });
     },
     onHistoryReset: (cleared) => {
+      setSimpleNotice({ tone: "ok", text: `已重置 · 清空 ${cleared} 条` });
       append({ kind: "system", text: `对话已清空(server 端 ${cleared} 条消息已 drop)` });
     },
     onError: (where, message) => {
+      console.warn("[voice-ui-error]", where, message);
+      setSimpleNotice({ tone: "error", text: `${where}: ${message}` });
       append({ kind: "system", text: `[${where}] ${message}` });
       if (where === "asr" || where === "ws" || where === "mic" || where === "worklet") {
+        pendingRecordStopRef.current = false;
         setChatting(false);
         activeAssistantIdRef.current = null;
       }
@@ -1026,6 +1137,7 @@ export default function App() {
     onRetry: (r) => {
       const text = `⟳ ${r.where} 重试 ${r.attempt}/${r.max_attempts} (${r.wait_ms}ms 后)  ${r.reason}`;
       pulseSemantic(`${r.where} ${r.reason}`, "system", 0.62);
+      setSimpleNotice({ tone: "warn", text });
       setRetryBanner({ text, until: Date.now() + 6000 });
       // also leave a system message so user has a record
       append({ kind: "system", text });
@@ -1080,6 +1192,25 @@ export default function App() {
   useEffect(() => {
     setRecordingStartedAt(ws.recording ? Date.now() : null);
   }, [ws.recording]);
+
+  useEffect(() => {
+    if (ws.recording) {
+      setSimpleNotice({ tone: "info", text: `录音中 · peak ${(ws.peak * 100).toFixed(0)}%` });
+      if (pendingRecordStopRef.current) {
+        pendingRecordStopRef.current = false;
+        ws.stopRecording();
+      }
+    }
+  }, [ws.recording, ws.peak, ws.stopRecording]);
+
+  useEffect(() => {
+    if (ws.handsfree) {
+      setSimpleNotice({
+        tone: "info",
+        text: ws.vadState === "speech" ? "免按键 · 正在说话" : "免按键监听中",
+      });
+    }
+  }, [ws.handsfree, ws.vadState]);
 
   // hands-free 收尾:VAD 判定话轮结束的瞬间打一个收束脉冲 — 星云上有个
   // "收到"的能量注入,随后 chat 起来自然过渡到 thinking。
@@ -1187,7 +1318,7 @@ export default function App() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [entries]);
+  }, [entries, debugLogOpen]);
 
   const deleteTranscript = useCallback(async (transcriptId: string, entryId: string) => {
     try {
@@ -1202,6 +1333,7 @@ export default function App() {
   const submitComposerTts = useCallback(() => {
     const t = ttsText.trim();
     if (!t || composerBusy) return;
+    audioQueue.unlock();
     setComposerBusy(true);
     audioQueue.stop();
     ws.ttsOneShot(t);
@@ -1214,6 +1346,7 @@ export default function App() {
   const submitComposerChat = useCallback(() => {
     const t = ttsText.trim();
     if (!t || chatting || !ws.connected) return;
+    audioQueue.unlock();
     audioQueue.stop();
     append({ kind: "user", text: t });
     beginAssistantTurn();
@@ -1236,6 +1369,9 @@ export default function App() {
      interrupts (server cancels chat task). */
   const onPressStart = useCallback(() => {
     if (ws.handsfree) return;  // push-to-talk disabled while hands-free is on
+    audioQueue.unlock();
+    pendingRecordStopRef.current = false;
+    setSimpleNotice({ tone: "info", text: "正在打开麦克风..." });
     audioQueue.stop();
     setCoalescing(false);
     pulseSemantic("voice input", "audio", 0.36);
@@ -1243,7 +1379,12 @@ export default function App() {
   }, [audioQueue, pulseSemantic, ws]);
 
   const onPressEnd = useCallback(() => {
-    if (ws.recording) ws.stopRecording();
+    if (ws.recording) {
+      ws.stopRecording();
+    } else {
+      pendingRecordStopRef.current = true;
+      setSimpleNotice({ tone: "info", text: "等待麦克风启动后收尾..." });
+    }
   }, [ws]);
 
   /* Keyboard: Space hold = push-to-talk while button is focused. */
@@ -1379,6 +1520,7 @@ export default function App() {
                 if (ws.handsfree) {
                   ws.stopHandsfree();
                 } else {
+                  audioQueue.unlock();
                   audioQueue.stop();
                   void ws.startHandsfree();
                 }
@@ -1412,351 +1554,473 @@ export default function App() {
               <RefreshCw size={17} />
             </button>
           </div>
+          {simpleNotice && (
+            <div
+              className={`max-w-full rounded-full border px-3 py-1 text-center text-xs font-mono shadow-[0_12px_30px_rgba(0,0,0,0.22)] ${
+                simpleNotice.tone === "error"
+                  ? "border-rose-500/50 bg-rose-500/10 text-rose-300"
+                  : simpleNotice.tone === "warn"
+                    ? "border-amber-500/50 bg-amber-500/10 text-amber-300"
+                    : simpleNotice.tone === "ok"
+                      ? "border-emerald-400/50 bg-emerald-400/10 text-emerald-200"
+                      : "border-cyan-400/40 bg-cyan-400/10 text-cyan-100"
+              }`}
+              role="status"
+            >
+              {simpleNotice.text}
+            </div>
+          )}
         </div>
       </div>
     );
   }
 
-  return (
-    <div className="flex h-full flex-col">
-      {/* Header — dense single-row status bar, TUI vibe.
-          Brand · Mode chip · Provider info · Latency · Actions */}
-      <header className="border-b border-(--color-border) bg-(--color-panel) px-4 py-1.5">
-        <div className="flex items-center gap-3 font-mono text-xs">
-          {/* Brand */}
-          <div className="flex items-center gap-1.5 text-(--color-text)">
-            <Sparkles size={14} className="text-(--color-accent)" />
-            <span className="font-semibold">able-asr</span>
+  const conversationEntries = entries.filter((e) => e.kind !== "system");
+  const logEntries = entries.filter((e) => e.kind === "system").slice(-80);
+  const providerBits = serverInfo
+    ? [
+        ["MODE", serverInfo.voice_mode ?? "chat"],
+        ["ASR", serverInfo.asr_model_id.split("/").pop() || serverInfo.asr_model_id],
+        ["LLM", serverInfo.llm_model_id],
+        ["TTS", serverInfo.tts_model_id.split("/").pop()?.replace("Qwen3-TTS-12Hz-", "") || serverInfo.tts_model_id],
+      ]
+    : [];
+  const debugPhase =
+    !ws.connected ? "offline" :
+    ws.recording ? "recording" :
+    polishing ? "polishing" :
+    audioQueue.playing ? "speaking" :
+    chatting ? "thinking" :
+    ws.handsfree ? `handsfree:${ws.vadState ?? "ready"}` :
+    "ready";
+
+  const renderConversationEntry = (e: Entry) => {
+    const footerBits: string[] = [];
+    if (e.kind === "user" && e.ms !== undefined) footerBits.push(`${e.ms}ms`);
+    if (e.bytes) footerBits.push(`${(e.bytes / 1024).toFixed(1)} KB`);
+    if (e.peakLevel !== undefined && e.peakLevel !== null) {
+      footerBits.push(`peak ${(e.peakLevel * 100).toFixed(0)}%`);
+    }
+    if (e.createdAt) footerBits.push(e.createdAt.slice(11, 19));
+    if (e.kind === "assistant") {
+      if (e.audioChunks !== undefined && e.audioChunks > 0) {
+        footerBits.push(`${e.audioChunks} audio`);
+      }
+      if (!e.streaming && e.ms !== undefined) footerBits.push(`${e.ms}ms`);
+    }
+    const canReplay = e.kind === "assistant" && !e.streaming && e.text && !e.text.endsWith("[⏹ 已打断]");
+    const footer = footerBits.length > 0 ? (
+      <div className="flex items-center gap-2">
+        <span>{footerBits.join(" · ")}</span>
+        {canReplay && (
+          <button
+            type="button"
+            onClick={() => { audioQueue.unlock(); audioQueue.stop(); ws.ttsOneShot(e.text); }}
+            className="rounded p-0.5 transition hover:bg-white/5 hover:text-(--color-text)"
+            title="再播一次"
+          >
+            <Volume2 size={12} />
+          </button>
+        )}
+        {e.transcriptId && (
+          <button
+            type="button"
+            onClick={() => deleteTranscript(e.transcriptId!, e.id)}
+            className="rounded p-0.5 transition hover:bg-rose-500/10 hover:text-rose-300"
+            title="删除 transcript"
+          >
+            <Trash2 size={12} />
+          </button>
+        )}
+      </div>
+    ) : undefined;
+    const showPolishDiff = e.kind === "user" && e.raw && e.raw !== e.text;
+    const content =
+      e.kind === "assistant" && e.streaming ? (
+        <>
+          {e.text || <span className="text-(--color-muted)">思考中...</span>}
+          <span className="ml-1 inline-block h-4 w-1 -mb-0.5 animate-pulse bg-emerald-300/80" />
+        </>
+      ) : showPolishDiff ? (
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-2">
+            <span>{e.text}</span>
+            <span className="rounded border border-fuchsia-400/30 bg-fuchsia-400/10 px-1.5 py-0.5 text-[10px] text-fuchsia-200">
+              polish{e.polishMs ? ` ${e.polishMs}ms` : ""}
+            </span>
           </div>
-          {/* Mode chip */}
-          <ModeChip
-            connected={ws.connected}
-            recording={ws.recording}
-            polishing={polishing}
-            chatting={chatting}
-            playing={audioQueue.playing}
+          <div className="text-xs text-(--color-muted) line-through opacity-70">
+            原:{e.raw}
+          </div>
+        </div>
+      ) : (
+        e.text
+      );
+    return (
+      <Message key={e.id} role={e.kind} footer={footer} polishChanged={!!showPolishDiff}>
+        {content}
+      </Message>
+    );
+  };
+
+  return (
+    <div
+      className={`grid h-full min-h-0 bg-[#08090c] text-(--color-text) ${
+        debugLogOpen ? "xl:grid-cols-[minmax(0,1fr)_400px]" : "xl:grid-cols-1"
+      }`}
+    >
+      <main
+        ref={simpleRootRef}
+        tabIndex={0}
+        onKeyDown={onKeyDown}
+        onKeyUp={onKeyUp}
+        className="relative flex min-h-0 flex-col overflow-hidden bg-(--color-bg) outline-none"
+      >
+        <div
+          onClick={triggerVisualFeedback}
+          className="absolute inset-0"
+          aria-label="星云调试主画面"
+          title="点击星云触发一次视觉反馈"
+        >
+          <NeuralNebula
+            apiState={voiceVisualState}
+            frameless
+            className="h-full min-h-[520px] w-full"
           />
-          {/* Provider info — dense, TUI-style "ASR ... · LLM ... · TTS ..." */}
-          {serverInfo && (
-            <div className="flex items-center gap-3 text-(--color-muted) overflow-hidden">
-              <span className="whitespace-nowrap">
-                <span className="opacity-60">ASR </span>
-                <span className="text-cyan-400">{serverInfo.asr_model_id.split("/").pop()}</span>
-              </span>
-              <span className="text-(--color-border)">·</span>
-              <span className="whitespace-nowrap">
-                <span className="opacity-60">LLM </span>
-                <span className="text-cyan-400">{serverInfo.llm_model_id}</span>
-              </span>
-              <span className="text-(--color-border)">·</span>
-              <span className="whitespace-nowrap">
-                <span className="opacity-60">TTS </span>
-                <span className="text-cyan-400">{serverInfo.tts_model_id.split("/").pop()?.replace("Qwen3-TTS-12Hz-", "")}</span>
-              </span>
+        </div>
+
+        <header className="pointer-events-none absolute inset-x-0 top-0 z-20 px-5 py-4">
+          <div className="pointer-events-auto flex flex-wrap items-center gap-2">
+            <div className="inline-flex h-8 items-center gap-2 rounded-md border border-white/10 bg-black/35 px-2.5 text-sm font-semibold backdrop-blur">
+              <Sparkles size={15} className="text-teal-300" />
+              able voice debug
             </div>
-          )}
-          {/* Preset switcher — flips the whole provider stack at runtime */}
-          {presets.length > 0 && (
-            <label className="flex items-center gap-1 whitespace-nowrap" title="切换 provider 预设(运行时,下一轮生效)">
-              <span className="opacity-60 text-(--color-muted)">预设</span>
+            <ModeChip
+              connected={ws.connected}
+              recording={ws.recording}
+              polishing={polishing}
+              chatting={chatting}
+              playing={audioQueue.playing}
+            />
+            {providerBits.length > 0 && (
+              <div className="hidden min-w-0 items-center gap-2 rounded-md border border-white/10 bg-black/25 px-2 py-1 text-xs text-(--color-muted) backdrop-blur md:flex">
+                {providerBits.map(([label, value]) => (
+                  <span key={label} className="min-w-0 truncate">
+                    <span className="opacity-60">{label}</span>{" "}
+                    <span className="text-teal-200/90">{value}</span>
+                  </span>
+                ))}
+              </div>
+            )}
+            {presets.length > 0 && (
               <select
                 value={currentPreset ?? ""}
                 onChange={(e) => switchPreset(e.target.value)}
-                className="rounded border border-(--color-border) bg-(--color-bg) px-1.5 py-0.5 text-(--color-text) focus:outline-none focus:border-(--color-accent)"
+                className="h-8 rounded-md border border-white/10 bg-black/45 px-2 text-xs text-(--color-text) outline-none backdrop-blur transition focus:border-teal-300/60"
+                title="provider preset"
               >
                 {currentPreset === null && <option value="">默认(.env)</option>}
                 {presets.map((p) => (
                   <option key={p.name} value={p.name}>{p.label}</option>
                 ))}
               </select>
-            </label>
-          )}
-          {/* Latency stats — right-aligned via flex-1 spacer */}
-          <div className="flex-1" />
-          {latestTranscribeMs !== null && (
-            <span className="text-(--color-muted) whitespace-nowrap">
-              <span className="opacity-60">★ASR </span>
-              <span className="text-emerald-400">{latestTranscribeMs}ms</span>
-            </span>
-          )}
-          {/* Actions */}
-          {chatting && (
-            <button
-              type="button"
-              onClick={() => { ws.interrupt(); audioQueue.stop(); }}
-              className="inline-flex items-center gap-1 rounded border border-amber-500/60 px-2 py-0.5 text-amber-400 hover:bg-amber-500/10 transition"
-              title="打断 AI 回复"
-            >
-              <StopCircle size={11} />打断
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={resetConversation}
-            className="inline-flex items-center gap-1 rounded border border-(--color-border) px-2 py-0.5 text-(--color-muted) hover:border-(--color-accent) hover:text-(--color-accent) transition"
-            title="清空对话"
-          >
-            <RefreshCw size={11} />重置
-          </button>
-        </div>
-      </header>
-
-      {/* Workspace bar — dedicated row so the active ablework sandbox is
-          always visible. Click the chip to toggle the list panel. */}
-      <div className="border-b border-(--color-border) bg-(--color-bg) px-6 py-2 text-xs flex items-center gap-3">
-        <span className="text-(--color-muted)">📁 工作区</span>
-        <button
-          type="button"
-          onClick={() => setWsListOpen((v) => !v)}
-          className={`rounded-md px-2 py-0.5 transition border ${
-            currentWs.name
-              ? "border-(--color-warn) bg-(--color-warn)/15 text-(--color-warn) font-medium hover:bg-(--color-warn)/25"
-              : "border-(--color-border) text-(--color-muted) italic hover:border-(--color-accent)"
-          }`}
-          title='点击展开工作区列表(或说 "切到 X 工作区")'
-        >
-          {currentWs.name || "(默认 sandbox)"}
-        </button>
-        {lastAction && (
-          <span className="text-(--color-accent) font-medium">{lastAction.text}</span>
-        )}
-        <div className="flex-1" />
-        {workspaces.length > 0 && (
-          <span className="text-(--color-muted)">共 {workspaces.length} 个</span>
-        )}
-        <button
-          type="button"
-          onClick={() => ws.send({ type: "refresh_workspaces" })}
-          className="text-(--color-muted) hover:text-(--color-accent) px-1"
-          title="重新拉取工作区列表"
-        >⟳</button>
-      </div>
-
-      {/* Workspace list panel — slides down when open. Click name → set_workspace. */}
-      {wsListOpen && (
-        <div className="border-b border-(--color-border) bg-(--color-panel) px-6 py-3 max-h-64 overflow-y-auto">
-          <div className="mx-auto max-w-3xl flex flex-col gap-1">
-            <div className="text-xs text-(--color-muted) mb-1">
-              点击切换 · 说 "新建 X 工作区" 创建 · 说 "把对话搬到 X" 移动当前对话
-            </div>
-            {workspaces.length === 0 && (
-              <div className="text-sm text-(--color-muted) italic">列表为空 — 点 ⟳ 重新拉取</div>
             )}
-            {workspaces.map((w) => {
-              const active = w.id === currentWs.id;
-              return (
-                <button
-                  key={w.id}
-                  type="button"
-                  onClick={() => {
-                    ws.send({ type: "set_workspace", id: w.id });
-                    setWsListOpen(false);
-                  }}
-                  className={`flex items-center justify-between rounded px-2 py-1.5 text-sm transition text-left ${
-                    active
-                      ? "bg-(--color-warn)/15 text-(--color-warn) font-medium"
-                      : "hover:bg-(--color-bg)"
-                  }`}
-                >
-                  <span>{w.name}</span>
-                  <span className="text-xs text-(--color-muted) ml-2">
-                    {active && "✓ 当前 · "}{w.id.slice(0, 8)}
-                  </span>
-                </button>
-              );
-            })}
             <button
               type="button"
-              onClick={() => {
-                ws.send({ type: "set_workspace", id: "" });
-                setWsListOpen(false);
-              }}
-              className="mt-2 rounded px-2 py-1.5 text-sm text-(--color-muted) italic hover:bg-(--color-bg) text-left"
+              onClick={() => setWsListOpen((v) => !v)}
+              className="h-8 rounded-md border border-white/10 bg-black/35 px-2 text-xs text-(--color-muted) backdrop-blur transition hover:border-teal-300/50 hover:text-teal-100"
+              title="workspace"
             >
-              ↩ 回到默认 sandbox(无工作区)
+              {currentWs.name || "default sandbox"}
+            </button>
+            <div className="flex-1" />
+            <button
+              type="button"
+              onClick={() => setDebugLogOpen((v) => !v)}
+              className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2 text-xs backdrop-blur transition ${
+                debugLogOpen
+                  ? "border-teal-300/40 bg-teal-300/10 text-teal-100"
+                  : "border-white/10 bg-black/35 text-(--color-muted) hover:border-teal-300/50 hover:text-teal-100"
+              }`}
+              aria-pressed={debugLogOpen}
+              title={debugLogOpen ? "隐藏对话日志" : "显示对话日志"}
+            >
+              <PanelRight size={13} />
+              log
+            </button>
+            {chatting && (
+              <button
+                type="button"
+                onClick={() => { ws.interrupt(); audioQueue.stop(); }}
+                className="inline-flex h-8 items-center gap-1 rounded-md border border-amber-400/40 bg-black/30 px-2 text-xs text-amber-200 backdrop-blur transition hover:bg-amber-400/10"
+                title="打断"
+              >
+                <StopCircle size={13} />打断
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={resetConversation}
+              className="inline-flex h-8 items-center gap-1 rounded-md border border-white/10 bg-black/35 px-2 text-xs text-(--color-muted) backdrop-blur transition hover:border-teal-300/50 hover:text-teal-100"
+              title="重置"
+            >
+              <RefreshCw size={13} />重置
             </button>
           </div>
-        </div>
-      )}
 
-      {/* Retry banner — auto-fade after a few seconds */}
-      {retryBanner && (
-        <div className="border-b border-(--color-warn)/40 bg-(--color-warn)/10 px-6 py-1.5 text-xs text-(--color-warn) text-center">
-          {retryBanner.text}
-        </div>
-      )}
-
-      {/* Polish-in-flight banner */}
-      {polishing && (
-        <div className="border-b border-(--color-accent)/40 bg-(--color-accent)/10 px-6 py-1 text-xs text-(--color-accent) text-center">
-          ✨ 整理中…
-        </div>
-      )}
-
-      {/* API-state visualizer — always visible, not part of the auto-scrolled chat log. */}
-      <div className="border-b border-(--color-border) bg-(--color-bg) px-6 py-3">
-        <div className="mx-auto max-w-3xl">
-          <NeuralVoiceField apiState={voiceVisualState} className="h-32 sm:h-36" />
-        </div>
-      </div>
-
-      {/* Conversation */}
-      <section ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-8">
-        <div className="mx-auto flex max-w-3xl flex-col gap-4">
-          {entries.map((e) => {
-            const footerBits: string[] = [];
-            if (e.kind === "user" && e.ms !== undefined) footerBits.push(`${e.ms}ms`);
-            if (e.bytes) footerBits.push(`${(e.bytes / 1024).toFixed(1)} KB`);
-            if (e.peakLevel !== undefined && e.peakLevel !== null) {
-              footerBits.push(`peak ${(e.peakLevel * 100).toFixed(0)}%`);
-            }
-            if (e.createdAt) footerBits.push(e.createdAt.slice(11, 19));
-            if (e.kind === "assistant") {
-              if (e.audioChunks !== undefined && e.audioChunks > 0) {
-                footerBits.push(`🔊 ${e.audioChunks} 段`);
-              }
-              if (!e.streaming && e.ms !== undefined) footerBits.push(`${e.ms}ms`);
-            }
-            const canReplay = e.kind === "assistant" && !e.streaming && e.text && !e.text.endsWith("[⏹ 已打断]");
-            const footer = footerBits.length > 0 ? (
-              <div className="flex items-center gap-2">
-                <span>{footerBits.join(" · ")}</span>
-                {canReplay && (
+          {wsListOpen && (
+            <div className="pointer-events-auto mt-3 max-h-56 w-full max-w-xl overflow-y-auto rounded-md border border-white/10 bg-[#0d0e13]/95 p-2 shadow-[0_18px_60px_rgba(0,0,0,0.45)] backdrop-blur">
+              {workspaces.length === 0 && (
+                <div className="px-2 py-2 text-sm text-(--color-muted)">工作区列表为空</div>
+              )}
+              {workspaces.map((w) => {
+                const active = w.id === currentWs.id;
+                return (
                   <button
+                    key={w.id}
                     type="button"
-                    onClick={() => { audioQueue.stop(); ws.ttsOneShot(e.text); }}
-                    className="rounded p-0.5 hover:bg-(--color-accent)/10 hover:text-(--color-accent) transition"
-                    title="再播一次(走 TTS,server 端不重新生成 LLM)"
+                    onClick={() => {
+                      ws.send({ type: "set_workspace", id: w.id });
+                      setWsListOpen(false);
+                    }}
+                    className={`flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-sm transition ${
+                      active
+                        ? "bg-teal-300/10 text-teal-100"
+                        : "text-(--color-muted) hover:bg-white/5 hover:text-(--color-text)"
+                    }`}
                   >
-                    <Volume2 size={12} />
+                    <span>{w.name}</span>
+                    <span className="text-xs opacity-55">{w.id.slice(0, 8)}</span>
                   </button>
-                )}
-                {e.transcriptId && (
-                  <button
-                    type="button"
-                    onClick={() => deleteTranscript(e.transcriptId!, e.id)}
-                    className="rounded p-0.5 hover:bg-(--color-error)/10 hover:text-(--color-error) transition"
-                    title="删除这条 transcript(server 端 SQLite 也删)"
-                  >
-                    <Trash2 size={12} />
-                  </button>
-                )}
-              </div>
-            ) : undefined;
-            const showPolishDiff = e.kind === "user" && e.raw && e.raw !== e.text;
-            const content =
-              e.kind === "assistant" && e.streaming ? (
-                <>
-                  {e.text || <span className="text-(--color-muted) italic">思考中…</span>}
-                  <span className="ml-0.5 inline-block w-1.5 h-4 -mb-0.5 bg-(--color-accent) animate-pulse" />
-                </>
-              ) : showPolishDiff ? (
-                // Polish changed the text — show polished (bold) above,
-                // raw (struck-through dim) below so user sees the diff.
-                <div className="flex flex-col gap-1">
-                  <div className="flex items-center gap-2">
-                    <span className="font-medium">{e.text}</span>
-                    <span className="text-[10px] text-(--color-accent) px-1.5 py-0.5 rounded bg-(--color-accent)/10">
-                      ✨ 已整理{e.polishMs ? ` ${e.polishMs}ms` : ""}
-                    </span>
-                  </div>
-                  <div className="text-xs text-(--color-muted) line-through opacity-70">
-                    原:{e.raw}
-                  </div>
-                </div>
-              ) : (
-                e.text
-              );
-            return (
-              <Message key={e.id} role={e.kind} footer={footer} polishChanged={!!showPolishDiff}>
-                {content}
-              </Message>
-            );
-          })}
-          {!historyLoaded && (
-            <div className="flex items-center justify-center gap-2 text-xs text-(--color-muted)">
-              <Loader2 size={12} className="animate-spin" />
-              加载历史…
+                );
+              })}
+              <button
+                type="button"
+                onClick={() => {
+                  ws.send({ type: "set_workspace", id: "" });
+                  setWsListOpen(false);
+                }}
+                className="w-full rounded-md px-2 py-1.5 text-left text-sm text-(--color-muted) transition hover:bg-white/5 hover:text-(--color-text)"
+              >
+                default sandbox
+              </button>
             </div>
           )}
+        </header>
+
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 px-5 pb-5">
+          <div className="pointer-events-auto mx-auto flex w-fit max-w-full flex-col items-center gap-3">
+            {(retryBanner || polishing || simpleNotice) && (
+              <div className="flex max-w-[min(760px,calc(100vw-40px))] flex-wrap justify-center gap-2 text-xs">
+                {retryBanner && <span className="rounded-full border border-amber-400/30 bg-black/45 px-2.5 py-1 text-amber-200 backdrop-blur">{retryBanner.text}</span>}
+                {polishing && <span className="rounded-full border border-fuchsia-300/30 bg-black/45 px-2.5 py-1 text-fuchsia-200 backdrop-blur">整理中</span>}
+                {simpleNotice && (
+                  <span className={`rounded-full border bg-black/45 px-2.5 py-1 backdrop-blur ${
+                    simpleNotice.tone === "error"
+                      ? "border-rose-400/30 text-rose-200"
+                      : simpleNotice.tone === "warn"
+                        ? "border-amber-400/30 text-amber-200"
+                        : simpleNotice.tone === "ok"
+                          ? "border-emerald-300/30 text-emerald-200"
+                          : "border-teal-300/30 text-teal-100"
+                  }`}>
+                    {simpleNotice.text}
+                  </span>
+                )}
+              </div>
+            )}
+
+            <div className="flex items-center gap-2 rounded-full border border-white/10 bg-black/40 p-2 shadow-[0_18px_60px_rgba(0,0,0,0.36)] backdrop-blur">
+              <button
+                type="button"
+                onClick={toggleCoalescing}
+                className={`flex size-10 items-center justify-center rounded-full border transition ${
+                  coalescing
+                    ? "border-emerald-300/70 bg-emerald-400/12 text-emerald-200 shadow-[0_0_24px_rgba(52,211,153,0.24)]"
+                    : "border-cyan-400/30 text-cyan-100/75 hover:border-emerald-300/70 hover:text-emerald-200"
+                }`}
+                aria-label="聚合收缩"
+                aria-pressed={coalescing}
+                title="聚合收缩"
+              >
+                <span className="size-3 rounded-full bg-current/35 shadow-[0_0_10px_currentColor]" />
+              </button>
+              <button
+                type="button"
+                onMouseDown={onPressStart}
+                onMouseUp={onPressEnd}
+                onMouseLeave={() => { if (ws.recording) onPressEnd(); }}
+                onTouchStart={(e) => { e.preventDefault(); onPressStart(); }}
+                onTouchEnd={(e) => { e.preventDefault(); onPressEnd(); }}
+                disabled={!ws.connected || ws.handsfree}
+                className={`flex size-14 items-center justify-center rounded-full border-2 transition ${
+                  ws.recording
+                    ? "border-amber-400 bg-amber-500/25 text-amber-200 shadow-[0_0_30px_rgba(245,158,11,0.28)]"
+                    : !ws.connected || ws.handsfree
+                      ? "cursor-not-allowed border-(--color-border) text-(--color-muted) opacity-45"
+                      : "border-cyan-400/45 text-cyan-100 hover:border-amber-400 hover:text-amber-200"
+                }`}
+                aria-label="按住录音"
+                title={ws.handsfree ? "免按键模式下停用(关掉免按键再用)" : "按住录音 / Space / ⌘⇧Space"}
+              >
+                {ws.recording ? (
+                  <Square size={17} className="fill-amber-300 text-amber-300" />
+                ) : (
+                  <Mic size={20} />
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (ws.handsfree) {
+                    ws.stopHandsfree();
+                  } else {
+                    audioQueue.unlock();
+                    audioQueue.stop();
+                    void ws.startHandsfree();
+                  }
+                }}
+                disabled={!ws.connected}
+                className={`flex size-10 items-center justify-center rounded-full border transition ${
+                  ws.handsfree
+                    ? "border-emerald-300/70 bg-emerald-400/15 text-emerald-200 shadow-[0_0_24px_rgba(52,211,153,0.28)]"
+                    : !ws.connected
+                      ? "cursor-not-allowed border-(--color-border) text-(--color-muted) opacity-45"
+                      : "border-cyan-400/30 text-cyan-100/75 hover:border-emerald-300/70 hover:text-emerald-200"
+                }`}
+                aria-label="免按键模式"
+                aria-pressed={ws.handsfree}
+                title={ws.handsfree
+                  ? `免按键监听中${ws.vadState === "speech" ? "(说话中)" : ""} - 点击关闭`
+                  : "免按键:VAD 自动断句,说话即录(点击开启)"}
+              >
+                <AudioLines
+                  size={18}
+                  className={ws.handsfree && ws.vadState === "speech" ? "animate-pulse" : ""}
+                />
+              </button>
+            </div>
+          </div>
         </div>
-      </section>
 
-      {/* Recording meter — own row, only when recording. mm:ss + bar. */}
-      {ws.recording && (
-        <RecordingMeter level={ws.level} peak={ws.peak} startedAt={recordingStartedAt} />
+        {ws.recording && (
+          <div className="absolute inset-x-0 bottom-24 z-20 px-5">
+            <RecordingMeter level={ws.level} peak={ws.peak} startedAt={recordingStartedAt} />
+          </div>
+        )}
+      </main>
+
+      {debugLogOpen && (
+        <aside className="flex min-h-0 flex-col border-t border-white/8 bg-[#0d0e13] xl:border-l xl:border-t-0">
+          <div className="border-b border-white/8 px-4 py-3">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold">对话日志</div>
+                <div className="mt-0.5 font-mono text-[10px] text-(--color-muted)">{debugPhase}</div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDebugLogOpen(false)}
+                className="inline-flex h-8 items-center gap-1 rounded-md border border-white/10 px-2 text-xs text-(--color-muted) transition hover:border-teal-300/50 hover:text-teal-100"
+                title="隐藏对话日志"
+              >
+                <PanelRight size={13} />隐藏
+              </button>
+            </div>
+            <div className="grid grid-cols-4 gap-1.5 text-xs">
+              <div className="rounded-md border border-white/8 bg-white/[0.025] p-2">
+                <div className="text-(--color-muted)">ws</div>
+                <div className={ws.connected ? "text-emerald-200" : "text-rose-200"}>{ws.connected ? "on" : "off"}</div>
+              </div>
+              <div className="rounded-md border border-white/8 bg-white/[0.025] p-2">
+                <div className="text-(--color-muted)">vad</div>
+                <div className="truncate text-(--color-text)">{ws.handsfree ? (ws.vadState ?? "on") : "off"}</div>
+              </div>
+              <div className="rounded-md border border-white/8 bg-white/[0.025] p-2">
+                <div className="text-(--color-muted)">msg</div>
+                <div className="font-mono text-(--color-text)">{conversationEntries.length}</div>
+              </div>
+              <div className="rounded-md border border-white/8 bg-white/[0.025] p-2">
+                <div className="text-(--color-muted)">asr</div>
+                <div className="font-mono text-(--color-text)">{latestTranscribeMs ?? "-"}ms</div>
+              </div>
+            </div>
+            <div className="mt-3 space-y-1 font-mono text-[11px]">
+              {providerBits.map(([label, value]) => (
+                <div key={label} className="flex gap-2">
+                  <span className="w-8 text-(--color-muted)">{label}</span>
+                  <span className="min-w-0 flex-1 truncate text-teal-100/85">{value}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <section ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+            <div className="flex flex-col gap-4">
+              {conversationEntries.length === 0 && historyLoaded && (
+                <div className="rounded-md border border-dashed border-white/10 px-3 py-8 text-center text-sm text-(--color-muted)">
+                  暂无对话
+                </div>
+              )}
+              {conversationEntries.map(renderConversationEntry)}
+              {!historyLoaded && (
+                <div className="flex items-center justify-center gap-2 text-xs text-(--color-muted)">
+                  <Loader2 size={12} className="animate-spin" />
+                  加载历史...
+                </div>
+              )}
+            </div>
+          </section>
+
+          <details className="border-t border-white/8 px-4 py-3 text-xs text-(--color-muted)">
+            <summary className="cursor-pointer select-none">系统事件 {logEntries.length}</summary>
+            <div className="mt-3 max-h-40 space-y-2 overflow-y-auto">
+              {logEntries.length === 0 && (
+                <div className="rounded-md border border-dashed border-white/10 px-3 py-3 text-center">
+                  no events
+                </div>
+              )}
+              {logEntries.map((e) => (
+                <div key={e.id} className="rounded-md border border-white/8 bg-white/[0.025] px-3 py-2 leading-relaxed">
+                  {e.text}
+                </div>
+              ))}
+            </div>
+          </details>
+
+          <footer className="border-t border-white/8 px-4 py-3">
+            <form
+              className="flex items-center gap-2"
+              onSubmit={(e) => { e.preventDefault(); submitComposerChat(); }}
+            >
+              <input
+                type="text"
+                value={ttsText}
+                onChange={(ev) => setTtsText(ev.target.value)}
+                placeholder="输入文字对话"
+                className="h-10 min-w-0 flex-1 rounded-md border border-white/10 bg-[#08090c] px-3 text-sm text-(--color-text) outline-none transition placeholder:text-(--color-muted)/60 focus:border-teal-300/60"
+              />
+              <button
+                type="button"
+                onClick={submitComposerTts}
+                disabled={!ttsText.trim() || composerBusy || !ws.connected}
+                className="flex size-10 items-center justify-center rounded-md border border-white/10 text-(--color-muted) transition hover:border-teal-300/50 hover:text-teal-100 disabled:cursor-not-allowed disabled:opacity-40"
+                title="试听 TTS"
+              >
+                {composerBusy ? <Loader2 size={15} className="animate-spin" /> : <Volume2 size={15} />}
+              </button>
+              <button
+                type="submit"
+                disabled={!ttsText.trim() || chatting || !ws.connected}
+                className="flex size-10 items-center justify-center rounded-md border border-teal-300/30 bg-teal-300/10 text-teal-100 transition hover:bg-teal-300/15 disabled:cursor-not-allowed disabled:opacity-40"
+                title="发送"
+              >
+                {chatting ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
+              </button>
+            </form>
+          </footer>
+        </aside>
       )}
-
-      {/* Composer — TTS try-out + central record button */}
-      <div className="border-t border-(--color-border) bg-(--color-panel) px-4 py-2 flex items-center gap-3">
-        {/* Record button — compact, left-aligned */}
-        <button
-          type="button"
-          onMouseDown={onPressStart}
-          onMouseUp={onPressEnd}
-          onMouseLeave={() => { if (ws.recording) onPressEnd(); }}
-          onTouchStart={(e) => { e.preventDefault(); onPressStart(); }}
-          onTouchEnd={(e) => { e.preventDefault(); onPressEnd(); }}
-          onKeyDown={onKeyDown}
-          onKeyUp={onKeyUp}
-          disabled={!ws.connected}
-          className={`flex size-10 items-center justify-center rounded-full border-2 transition shrink-0
-            ${ws.recording
-              ? "border-amber-500 bg-amber-500/30 animate-pulse"
-              : !ws.connected
-              ? "border-(--color-border)/50 bg-(--color-bg) opacity-50 cursor-not-allowed"
-              : "border-(--color-border) bg-(--color-bg) hover:border-amber-500 hover:text-amber-500"
-            }`}
-          aria-label="按住录音"
-          title="按住录音 / Space / ⌘⇧Space"
-        >
-          {ws.recording ? (
-            <Square size={14} className="fill-amber-500 text-amber-500" />
-          ) : (
-            <Mic size={16} className="text-(--color-text)" />
-          )}
-        </button>
-        {/* Composer — type to chat (Enter / 发送), or 🔊 to try TTS only */}
-        <form
-          className="flex flex-1 items-center gap-2"
-          onSubmit={(e) => { e.preventDefault(); submitComposerChat(); }}
-        >
-          <input
-            type="text"
-            value={ttsText}
-            onChange={(ev) => setTtsText(ev.target.value)}
-            placeholder='输入文字对话 · 或按住录音按钮说话'
-            className="flex-1 rounded border border-(--color-border) bg-(--color-bg) px-3 py-1.5 text-sm placeholder:text-(--color-muted)/60 focus:outline-none focus:border-(--color-accent)"
-          />
-          <button
-            type="button"
-            onClick={submitComposerTts}
-            disabled={!ttsText.trim() || composerBusy || !ws.connected}
-            className="inline-flex items-center gap-1 rounded border border-(--color-border) bg-(--color-bg) px-2.5 py-1.5 text-sm transition hover:border-(--color-accent) hover:text-(--color-accent) disabled:opacity-40 disabled:cursor-not-allowed"
-            title="仅合成播放(不进对话)"
-          >
-            {composerBusy ? <Loader2 size={13} className="animate-spin" /> : <Volume2 size={13} />}
-          </button>
-          <button
-            type="submit"
-            disabled={!ttsText.trim() || chatting || !ws.connected}
-            className="inline-flex items-center gap-1 rounded border border-(--color-border) bg-(--color-bg) px-2.5 py-1.5 text-sm transition hover:border-(--color-accent) hover:text-(--color-accent) disabled:opacity-40 disabled:cursor-not-allowed"
-            title="发送到对话(Enter)"
-          >
-            {chatting ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
-            发送
-          </button>
-        </form>
-      </div>
-
-      {/* Hotkey hints — bottom strip, TUI Footer parity */}
-      <HotkeyHints
-        onSpace={() => ws.recording ? onPressEnd() : onPressStart()}
-        onInterrupt={() => { ws.interrupt(); audioQueue.stop(); }}
-        onReset={resetConversation}
-        onToggleWsList={() => setWsListOpen((v) => !v)}
-        onTogglePolish={() => ws.send({ type: "set_polish", enabled: false })}
-      />
     </div>
   );
 }

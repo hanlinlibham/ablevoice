@@ -267,6 +267,7 @@ class WsSession:
         return {
             "asr_provider": settings.asr.provider,
             "asr_model_id": settings.asr_active_model_id,
+            "voice_mode": settings.voice_mode,
             "tts_provider": settings.tts.provider,
             "tts_model_id": settings.tts_active_model_id,
             "tts_voice":    settings.tts.voice,
@@ -279,6 +280,61 @@ class WsSession:
 
     async def send_ready(self) -> None:
         await self.send_json({"type": "ready", **self._config_snapshot()})
+
+    async def _emit_asr_tts_turn(self, text: str) -> None:
+        """VOICE_MODE=asr_tts: speak the recognized/typed text directly.
+
+        This is an evaluation mode for ASR + TTS latency/quality. It keeps
+        the normal WS event shape so existing clients can reuse the same
+        placeholder bubble and playback path, but it never calls the LLM.
+        """
+        t0 = time.monotonic()
+        await self.send_json({
+            "type": "meta",
+            "model": "asr_tts",
+            "voice": self.voice_override or settings.tts.voice,
+        })
+        try:
+            from .audio import strip_tts_unfriendly
+            spoken = strip_tts_unfriendly(text).strip() or text
+            wav_bytes, sr, n_samples = await synth_one(
+                spoken, voice=self.voice_override,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("asr_tts TTS failed")
+            total_ms = int((time.monotonic() - t0) * 1000)
+            await self.send_json({
+                "type": "error",
+                "where": "asr_tts_tts",
+                "message": f"{type(exc).__name__}: {exc}",
+            })
+            await self.send_json({
+                "type": "chat_done",
+                "full_text": text,
+                "total_ms": total_ms,
+                "n_audio": 0,
+                "history_len": 0,
+            })
+            return
+
+        total_ms = int((time.monotonic() - t0) * 1000)
+        dur_ms = int(1000 * n_samples / sr) if n_samples and sr else 0
+        b64 = base64.b64encode(wav_bytes).decode("ascii") if wav_bytes else ""
+        await self.send_json({
+            "type": "audio_chunk",
+            "text": text,
+            "b64": b64,
+            "dur_ms": dur_ms,
+            "synth_ms": total_ms,
+            "idx": 1,
+        })
+        await self.send_json({
+            "type": "chat_done",
+            "full_text": text,
+            "total_ms": total_ms,
+            "n_audio": 1 if wav_bytes else 0,
+            "history_len": 0,
+        })
 
     # --- event handlers -----------------------------------------------------
 
@@ -499,6 +555,21 @@ class WsSession:
         if not said:
             return
 
+        if settings.voice_mode == "asr_tts":
+            await self.send_json({
+                "type": "transcript_polished",
+                "id": transcript_id,
+                "text": said,
+                "raw": said,
+                "skipped": True,
+                "attempts": 0,
+                "ok": True,
+                "errors": ["voice_mode_asr_tts"],
+                "ms": 0,
+            })
+            await self._emit_asr_tts_turn(said)
+            return
+
         # Meta-command fast path — deterministic short commands
         # ("停"/"慢点"/"大声点" etc.) bypass polish + LLM intent classify
         # + chat entirely. Saves ~3s for these high-frequency control
@@ -619,6 +690,10 @@ class WsSession:
 
         logger.info("ws text_message session=%s → %r",
                     (self.session_id or "?")[:8], text[:60])
+
+        if settings.voice_mode == "asr_tts":
+            await self._emit_asr_tts_turn(text)
+            return
 
         # Intent (workspace ops) on the typed text — same as the voice path.
         try:
